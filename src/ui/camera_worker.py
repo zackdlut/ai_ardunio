@@ -98,7 +98,7 @@ class CameraWorker(QThread):
         self.status_message.emit("正在加载检测模型…")
         try:
             self._detector.load(status=self.status_message.emit)
-            if self._running and self._detector.enabled and self._detector.runtime_label != "Intel NPU":
+            if self._running and self._detector.enabled and self._detector.runtime == "cpu":
                 dummy = np.zeros((480, 640, 3), dtype=np.uint8)
                 self._detector.detect(dummy)
             if self._running:

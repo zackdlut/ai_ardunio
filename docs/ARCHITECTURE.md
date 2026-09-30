@@ -607,7 +607,7 @@ sequenceDiagram
 | `ARDUINO_CLI` | CLI 可执行文件路径 |
 | `CAMERA_INDEX` | 默认摄像头索引 |
 | `YOLO_MODEL_PATH` | 自定义权重；缺失则用 `yolov8n.pt` |
-| `YOLO_DEVICE` | `auto` / `cpu` / `npu`。`auto` 在检测到 Intel NPU 时用 OpenVINO 跑检测，否则 CPU |
+| `YOLO_DEVICE` | `gpu`（默认，Intel 核显）/ `npu` / `cpu` / `auto`。`auto` 优先 NPU，失败再改用核显，再不行用 CPU |
 | `DATABASE_PATH` | SQLite 文件路径 |
 | `ASR_BACKEND` | `local` / `remote` |
 | `WHISPER_MODEL_SIZE` | 本地 ASR 模型规模 |

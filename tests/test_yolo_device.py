@@ -13,6 +13,7 @@ from vision.detector import (  # noqa: E402
     is_openvino_model,
     openvino_export_dir,
     openvino_export_is_fresh,
+    read_npu_compile_status,
     select_yolo_runtime,
 )
 
@@ -24,6 +25,9 @@ def test_select_yolo_runtime() -> None:
     assert select_yolo_runtime("npu", False) == "cpu"
     assert select_yolo_runtime("cpu", True) == "cpu"
     assert select_yolo_runtime(" CPU ", False) == "cpu"
+    assert select_yolo_runtime("gpu", True, True) == "gpu"
+    assert select_yolo_runtime("gpu", True, False) == "cpu"
+    assert select_yolo_runtime("auto", False, True) == "gpu"
 
 
 def test_openvino_export_cache(tmp_path: Path) -> None:
@@ -42,3 +46,17 @@ def test_openvino_export_cache(tmp_path: Path) -> None:
     time.sleep(0.05)
     weights.write_bytes(b"pt2")
     assert not openvino_export_is_fresh(weights, export_dir)
+
+
+def test_read_npu_compile_status(tmp_path: Path) -> None:
+    xml = tmp_path / "best.xml"
+    xml.write_text("<net/>", encoding="utf-8")
+    status = tmp_path / "npu_compile.txt"
+    assert read_npu_compile_status(status, xml.stat().st_mtime, "2408") is None
+
+    status.write_text("2408 fail\n", encoding="utf-8")
+    assert read_npu_compile_status(status, xml.stat().st_mtime, "2408") is None
+
+    status.write_text("2408 tiles1 fail\n", encoding="utf-8")
+    assert read_npu_compile_status(status, xml.stat().st_mtime, "2408") == "fail"
+    assert read_npu_compile_status(status, xml.stat().st_mtime, "9999") is None

@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AsrBackend = Literal["local", "remote"]
 TtsBackend = Literal["local"]
-YoloDevice = Literal["auto", "cpu", "npu"]
+YoloDevice = Literal["auto", "cpu", "gpu", "npu"]
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     yolo_model_path: Path = Field(
         default=ROOT_DIR / "models" / "best.pt", alias="YOLO_MODEL_PATH"
     )
-    yolo_device: YoloDevice = Field(default="auto", alias="YOLO_DEVICE")
+    yolo_device: YoloDevice = Field(default="gpu", alias="YOLO_DEVICE")
     database_path: Path = Field(
         default=ROOT_DIR / "data" / "copilot.db", alias="DATABASE_PATH"
     )
