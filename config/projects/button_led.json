@@ -1,0 +1,32 @@
+{
+  "id": "button_led",
+  "title": "Button + LED",
+  "steps": [
+    {
+      "id": "insert_led",
+      "requires": ["LED"],
+      "hint": "将 LED 插入面包板"
+    },
+    {
+      "id": "insert_button",
+      "requires": ["Button"],
+      "hint": "将按钮插入面包板"
+    },
+    {
+      "id": "insert_resistor",
+      "requires": ["Resistor"],
+      "hint": "为 LED 串联限流电阻"
+    },
+    {
+      "id": "wire_circuit",
+      "requires": ["JumperWire"],
+      "hint": "按教程连接按钮与 LED"
+    },
+    {
+      "id": "upload",
+      "action": "upload_sketch",
+      "sketch": "button_led",
+      "hint": "编译并烧录 Button+LED 程序"
+    }
+  ]
+}

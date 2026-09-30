@@ -1,0 +1,36 @@
+{
+  "id": "blink",
+  "title": "Blink LED",
+  "steps": [
+    {
+      "id": "insert_led",
+      "requires": ["LED"],
+      "hint": "将 LED 插入面包板"
+    },
+    {
+      "id": "insert_resistor",
+      "requires": ["Resistor"],
+      "hint": "LED 与电阻串联"
+    },
+    {
+      "id": "connect_d13",
+      "requires": ["JumperWire"],
+      "spatial": "near_uno_d13",
+      "hint": "Connect to D13",
+      "pin": "D13"
+    },
+    {
+      "id": "connect_gnd",
+      "requires": ["JumperWire"],
+      "spatial": "near_uno_gnd",
+      "hint": "Connect to GND",
+      "pin": "GND"
+    },
+    {
+      "id": "upload",
+      "action": "upload_sketch",
+      "sketch": "blink",
+      "hint": "编译并烧录 Blink 程序"
+    }
+  ]
+}

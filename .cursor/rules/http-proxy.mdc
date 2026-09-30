@@ -1,0 +1,32 @@
+---
+description: Use corporate HTTP proxy for pip, curl, and network CLI in this repo
+alwaysApply: true
+---
+
+# HTTP proxy for CLI
+
+When running **pip**, **curl**, **wget**, **npm**, **git clone/fetch** (if needed), or any other command that downloads from the network in this project, always route traffic through:
+
+- `http://10.158.100.9:8080`
+
+## PowerShell (preferred on Windows)
+
+Set before the command (or in the same shell invocation):
+
+```powershell
+$env:HTTP_PROXY="http://10.158.100.9:8080"
+$env:HTTPS_PROXY="http://10.158.100.9:8080"
+$env:http_proxy="http://10.158.100.9:8080"
+$env:https_proxy="http://10.158.100.9:8080"
+```
+
+## Examples
+
+```powershell
+pip install -r requirements.txt
+curl -x http://10.158.100.9:8080 https://example.com
+```
+
+For pip you may also use: `pip install --proxy http://10.158.100.9:8080 ...`
+
+Do not omit the proxy for install/download commands unless the user explicitly says to run offline or without proxy.
