@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -8,6 +9,33 @@ import numpy as np
 
 from config.settings import get_settings
 from vision.component_db import normalize_class_name
+
+
+def _configure_inference_runtime() -> None:
+    """Keep OpenMP from pinning every core and spinning while idle."""
+    threads = os.environ.get("OMP_NUM_THREADS")
+    if not threads:
+        count = os.cpu_count() or 2
+        threads = str(max(1, min(4, count - 2)))
+        os.environ["OMP_NUM_THREADS"] = threads
+    os.environ.setdefault("MKL_NUM_THREADS", threads)
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
+
+def _apply_torch_thread_cap() -> None:
+    try:
+        import torch
+    except ImportError:
+        return
+    try:
+        torch.set_num_threads(max(1, int(os.environ.get("OMP_NUM_THREADS", "1"))))
+    except (RuntimeError, ValueError):
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
 
 
 @dataclass
@@ -50,11 +78,18 @@ class YOLODetector:
         self._try_load()
 
     def _try_load(self) -> None:
+        _configure_inference_runtime()
         try:
             from ultralytics import YOLO
+            from ultralytics.utils import events as yolo_events
         except ImportError:
             self._load_error = "ultralytics not installed"
             return
+
+        # Telemetry starts a thread from the predict callback and can stall the
+        # camera thread on Thread.start() while that post holds the GIL.
+        yolo_events.events.enabled = False
+        _apply_torch_thread_cap()
 
         if self._path.is_file():
             self._model = YOLO(str(self._path))

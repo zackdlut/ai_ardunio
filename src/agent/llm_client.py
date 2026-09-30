@@ -6,7 +6,26 @@ from typing import Any, Callable
 from openai import OpenAI
 
 from agent.prompts import SYSTEM_PROMPT
+from agent.think_stream import ThinkSplitter
 from config.settings import get_settings
+
+_REASONING_KEYS = ("reasoning", "reasoning_content", "thinking")
+
+
+def _field_text(obj: Any, names: tuple[str, ...]) -> str:
+    if obj is None:
+        return ""
+    for name in names:
+        value = getattr(obj, name, None)
+        if isinstance(value, str) and value:
+            return value
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict):
+        for name in names:
+            value = extra.get(name)
+            if isinstance(value, str) and value:
+                return value
+    return ""
 
 
 class _StreamInterrupted(Exception):
@@ -125,10 +144,11 @@ class LLMClient:
         max_rounds: int = 6,
         max_history_messages: int = 20,
         on_delta: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
         on_revoke: Callable[[], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
-        """Stream the spoken answer. Tool rounds stay silent; early speech is revoked."""
+        """Stream the spoken answer. Thinking tokens go to ``on_reasoning``."""
         system_content = SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
         prior = list(history or [])[-max_history_messages:]
         messages: list[dict[str, Any]] = [
@@ -148,6 +168,7 @@ class LLMClient:
                 completion_kwargs,
                 max_rounds,
                 on_delta,
+                on_reasoning,
                 on_revoke,
                 should_stop,
             )
@@ -162,6 +183,7 @@ class LLMClient:
         completion_kwargs: dict[str, Any],
         max_rounds: int,
         on_delta: Callable[[str], None] | None,
+        on_reasoning: Callable[[str], None] | None,
         on_revoke: Callable[[], None] | None,
         should_stop: Callable[[], bool] | None,
     ) -> str:
@@ -173,6 +195,7 @@ class LLMClient:
                 tools,
                 completion_kwargs,
                 on_delta=on_delta,
+                on_reasoning=on_reasoning,
                 on_revoke=on_revoke,
                 should_stop=should_stop,
             )
@@ -226,6 +249,7 @@ class LLMClient:
         tools: list[dict[str, Any]],
         completion_kwargs: dict[str, Any],
         on_delta: Callable[[str], None] | None,
+        on_reasoning: Callable[[str], None] | None,
         on_revoke: Callable[[], None] | None,
         should_stop: Callable[[], bool] | None,
     ) -> tuple[str, list[dict[str, str]] | None]:
@@ -237,9 +261,32 @@ class LLMClient:
             **completion_kwargs,
         )
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, str]] = {}
         emitted = False
         saw_tool = False
+        splitter = ThinkSplitter()
+
+        def emit_reasoning(text: str) -> None:
+            if not text:
+                return
+            reasoning_parts.append(text)
+            if on_reasoning is not None:
+                on_reasoning(text)
+
+        def emit_content(text: str) -> None:
+            nonlocal emitted
+            if not text or saw_tool:
+                return
+            if not content_parts:
+                text = text.lstrip()
+                if not text:
+                    return
+            content_parts.append(text)
+            if on_delta is not None:
+                on_delta(text)
+                emitted = True
+
         try:
             for chunk in stream:
                 if should_stop and should_stop():
@@ -249,12 +296,14 @@ class LLMClient:
                 delta = chunk.choices[0].delta
                 if delta is None:
                     continue
+                emit_reasoning(_field_text(delta, _REASONING_KEYS))
                 piece = getattr(delta, "content", None) or ""
-                if piece and not saw_tool:
-                    content_parts.append(piece)
-                    if on_delta is not None:
-                        on_delta(piece)
-                        emitted = True
+                if piece:
+                    for kind, text in splitter.push(piece):
+                        if kind == "reasoning":
+                            emit_reasoning(text)
+                        else:
+                            emit_content(text)
                 tool_deltas = getattr(delta, "tool_calls", None) or []
                 if tool_deltas:
                     if emitted and not saw_tool and on_revoke is not None:
@@ -270,7 +319,15 @@ class LLMClient:
                 except Exception:  # noqa: BLE001
                     pass
 
+        for kind, text in splitter.flush():
+            if kind == "reasoning":
+                emit_reasoning(text)
+            else:
+                emit_content(text)
+
         content = "".join(content_parts).strip()
+        if not saw_tool and not content:
+            content = "".join(reasoning_parts).strip()
         if not saw_tool:
             return content, None
         ordered = [tool_acc[index] for index in sorted(tool_acc)]

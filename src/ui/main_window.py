@@ -3,17 +3,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import Qt, QObject, QSize, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -28,6 +29,25 @@ from ui.camera_devices import list_cameras
 from ui.camera_worker import CameraWorker
 from ui.camera_widget import CameraWidget
 from ui.chat_widget import ChatWidget
+from ui.chrome import RoundedCard, ThemedMenu
+from ui.icons import (
+    bind_editor_menu,
+    icon_camera,
+    icon_clear,
+    icon_hardware,
+    icon_local,
+    icon_log,
+    icon_next,
+    icon_project,
+    icon_refresh,
+    icon_remote,
+    icon_speaker,
+    icon_stop,
+    icon_upload,
+    icon_view,
+    icon_voice,
+    with_label_gap,
+)
 from voice.asr import AsrBackend, create_asr
 from voice.sentences import SentenceBuffer
 from voice.session import VoiceSession
@@ -82,6 +102,7 @@ class ASRWorker(QThread):
 
 class LLMWorker(QThread):
     delta = Signal(int, str)
+    reasoning = Signal(int, str)
     revoke = Signal(int)
     succeeded = Signal(int, str)
     failed = Signal(int, str)
@@ -122,6 +143,7 @@ class LLMWorker(QThread):
                     history=self._history,
                     voice_mode=self._voice_mode,
                     on_delta=lambda text: self.delta.emit(self._turn, text),
+                    on_reasoning=lambda text: self.reasoning.emit(self._turn, text),
                     on_revoke=lambda: self.revoke.emit(self._turn),
                     should_stop=self.isInterruptionRequested,
                 )
@@ -221,9 +243,10 @@ class MainWindow(QMainWindow):
         self._syncing_voice_btn = False
         self._sentence_buf = SentenceBuffer()
         self._voice_streamed = False
+        self._answer_shown = False
 
         self._build_ui()
-        self._seed_camera_combo()
+        self._seed_camera_menu()
         self._update_step_label()
         self._chat.append_system(self._asr_mode_label())
 
@@ -233,7 +256,6 @@ class MainWindow(QMainWindow):
         self._camera.gesture_detected.connect(self._on_gesture)
         self._camera.status_message.connect(self._on_camera_status)
         self._camera.start()
-        self._camera_combo.currentIndexChanged.connect(self._on_camera_changed)
 
         self._voice_session = VoiceSession(self._settings, self)
         self._voice_session.utterance_ready.connect(self._on_utterance)
@@ -252,137 +274,41 @@ class MainWindow(QMainWindow):
         self._refresh_boards()
 
     def _build_ui(self) -> None:
+        self._build_menus()
+
         root = QWidget()
+        root.setObjectName("appCanvas")
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(self._build_top_bar())
 
-        title = QLabel("Arduino 学习助手")
-        title.setObjectName("appTitle")
-        layout.addWidget(title)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("mainSplitter")
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(12)
 
-        top = QHBoxLayout()
-        top.setSpacing(12)
+        workspace = QWidget()
+        workspace.setObjectName("workspace")
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(8)
 
-        camera_frame = QFrame()
+        camera_frame = RoundedCard(16)
         camera_frame.setObjectName("cameraFrame")
         camera_layout = QVBoxLayout(camera_frame)
         camera_layout.setContentsMargins(10, 10, 10, 10)
-        cam_header = QHBoxLayout()
-        cam_label = QLabel("工作台视野")
-        cam_label.setObjectName("sectionEyebrow")
-        cam_header.addWidget(cam_label)
-        cam_header.addStretch()
-        self._camera_combo = QComboBox()
-        self._camera_combo.setMinimumWidth(160)
-        refresh_cam_btn = QPushButton("刷新")
-        refresh_cam_btn.setToolTip("重新扫描本机摄像头")
-        refresh_cam_btn.clicked.connect(self._refresh_cameras)
-        cam_header.addWidget(QLabel("摄像头"))
-        cam_header.addWidget(self._camera_combo)
-        cam_header.addWidget(refresh_cam_btn)
-        camera_layout.addLayout(cam_header)
         self._camera_widget = CameraWidget()
-        camera_layout.addWidget(self._camera_widget, stretch=1)
-        top.addWidget(camera_frame, stretch=3)
+        self._camera_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._camera_widget.customContextMenuRequested.connect(self._show_camera_menu)
+        camera_layout.addWidget(self._camera_widget)
+        workspace_layout.addWidget(camera_frame, stretch=1)
 
-        side_panel = QFrame()
-        side_panel.setObjectName("sidePanel")
-        side = QVBoxLayout(side_panel)
-        side.setContentsMargins(14, 14, 14, 14)
-        side.setSpacing(10)
-
-        step_eyebrow = QLabel("当前步骤")
-        step_eyebrow.setObjectName("sectionEyebrow")
-        side.addWidget(step_eyebrow)
-
-        self._step_title = QLabel()
-        self._step_title.setObjectName("stepTitle")
-        side.addWidget(self._step_title)
-
-        self._step_progress = QProgressBar()
-        self._step_progress.setObjectName("stepProgress")
-        self._step_progress.setTextVisible(False)
-        self._step_progress.setFixedHeight(6)
-        side.addWidget(self._step_progress)
-
-        self._step_hint = QLabel()
-        self._step_hint.setObjectName("stepHint")
-        self._step_hint.setWordWrap(True)
-        side.addWidget(self._step_hint)
-
-        side.addSpacing(4)
-        hw_eyebrow = QLabel("硬件连接")
-        hw_eyebrow.setObjectName("sectionEyebrow")
-        side.addWidget(hw_eyebrow)
-
-        board_row = QHBoxLayout()
-        board_row.setSpacing(8)
-        self._port_combo = QComboBox()
-        refresh_btn = QPushButton("刷新")
-        refresh_btn.setToolTip("重新扫描已连接的 Arduino 开发板")
-        refresh_btn.clicked.connect(self._refresh_boards)
-        board_row.addWidget(self._port_combo, stretch=1)
-        board_row.addWidget(refresh_btn)
-        side.addLayout(board_row)
-
-        asr_row = QHBoxLayout()
-        asr_row.setSpacing(8)
-        self._asr_combo = QComboBox()
-        self._asr_combo.addItem("本地 Whisper", "local")
-        self._asr_combo.addItem("远程 Ollama ASR", "remote")
-        asr_idx = self._asr_combo.findData(self._settings.asr_backend)
-        if asr_idx >= 0:
-            self._asr_combo.setCurrentIndex(asr_idx)
-        self._asr_combo.setToolTip(
-            "本地：faster-whisper（CPU）；远程：Ollama qwen3-asr（见 .env）"
-        )
-        self._asr_combo.currentIndexChanged.connect(self._on_asr_mode_changed)
-        asr_row.addWidget(QLabel("语音识别"))
-        asr_row.addWidget(self._asr_combo, stretch=1)
-        side.addLayout(asr_row)
-
-        tts_row = QHBoxLayout()
-        tts_row.setSpacing(8)
-        self._tts_enabled = QCheckBox("语音回复")
-        self._tts_enabled.setChecked(self._settings.tts_enabled)
-        self._tts_enabled.setToolTip("文字提问后朗读回复。语音辅导会话中总会朗读。")
-        stop_tts_btn = QPushButton("停止朗读")
-        stop_tts_btn.clicked.connect(self._tts.stop)
-        tts_row.addWidget(self._tts_enabled)
-        tts_row.addWidget(stop_tts_btn)
-        side.addLayout(tts_row)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        adv_btn = QPushButton("下一步")
-        adv_btn.setToolTip("手动进入下一教学步骤")
-        adv_btn.clicked.connect(self._advance_step)
-        clear_chat_btn = QPushButton("清空对话")
-        clear_chat_btn.setToolTip("清除与助手的多轮记忆")
-        clear_chat_btn.clicked.connect(self._clear_dialog)
-        upload_btn = QPushButton("烧录 Blink")
-        upload_btn.setObjectName("primaryButton")
-        upload_btn.setToolTip("编译并上传 Blink 示例到所选串口")
-        upload_btn.clicked.connect(self._upload_blink)
-        btn_row.addWidget(adv_btn)
-        btn_row.addWidget(clear_chat_btn)
-        btn_row.addWidget(upload_btn)
-        side.addLayout(btn_row)
-        side.addStretch(1)
-        top.addWidget(side_panel, stretch=1)
-        layout.addLayout(top, stretch=5)
-
-        self._chat = ChatWidget()
-        self._chat.send_requested.connect(lambda t: self._on_chat(t, voice_mode=False))
-        self._chat.voice_session_toggled.connect(self._on_voice_toggled)
-        layout.addWidget(self._chat, stretch=3)
-
-        log_panel = QFrame()
-        log_panel.setObjectName("logPanel")
-        log_layout = QVBoxLayout(log_panel)
-        log_layout.setContentsMargins(12, 10, 12, 10)
+        self._log_panel = RoundedCard(16)
+        self._log_panel.setObjectName("logPanel")
+        log_layout = QVBoxLayout(self._log_panel)
+        log_layout.setContentsMargins(14, 12, 14, 12)
         log_layout.setSpacing(6)
         log_header = QLabel("编译与烧录")
         log_header.setObjectName("sectionEyebrow")
@@ -390,16 +316,218 @@ class MainWindow(QMainWindow):
         self._monitor = QTextEdit()
         self._monitor.setObjectName("buildLog")
         self._monitor.setReadOnly(True)
-        self._monitor.setMaximumHeight(120)
+        self._monitor.setMinimumHeight(96)
+        self._monitor.setMaximumHeight(160)
+        bind_editor_menu(self._monitor)
         log_layout.addWidget(self._monitor)
-        layout.addWidget(log_panel)
+        self._log_panel.hide()
+        workspace_layout.addWidget(self._log_panel)
+
+        sidebar = RoundedCard(16)
+        sidebar.setObjectName("sidePanel")
+        sidebar.setMinimumWidth(340)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(16, 14, 16, 12)
+        side.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        presence = QLabel("●")
+        presence.setObjectName("presenceDot")
+        copilot_title = QLabel("助教")
+        copilot_title.setObjectName("copilotTitle")
+        header.addWidget(presence)
+        header.addWidget(copilot_title)
+        header.addStretch(1)
+        side.addLayout(header)
+
+        step_eyebrow = QLabel("当前步骤")
+        step_eyebrow.setObjectName("sectionEyebrow")
+        side.addWidget(step_eyebrow)
+
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        self._step_title = QLabel()
+        self._step_title.setObjectName("stepTitle")
+        self._step_title.setWordWrap(True)
+        advance_btn = QPushButton("下一步")
+        advance_btn.setObjectName("primaryButton")
+        advance_btn.setToolTip("手动进入下一教学步骤")
+        advance_btn.clicked.connect(self._advance_step)
+        title_row.addWidget(self._step_title, stretch=1)
+        title_row.addWidget(advance_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        side.addLayout(title_row)
+
+        self._step_hint = QLabel()
+        self._step_hint.setObjectName("stepHint")
+        self._step_hint.setWordWrap(True)
+        side.addWidget(self._step_hint)
+
+        self._step_progress = QProgressBar()
+        self._step_progress.setObjectName("stepProgress")
+        self._step_progress.setTextVisible(False)
+        self._step_progress.setFixedHeight(3)
+        side.addWidget(self._step_progress)
+
+        divider = QFrame()
+        divider.setObjectName("sideDivider")
+        divider.setFrameShape(QFrame.Shape.NoFrame)
+        divider.setFixedHeight(1)
+        side.addWidget(divider)
+
+        self._chat = ChatWidget(model_name=self._settings.openai_model)
+        self._chat.send_requested.connect(lambda t: self._on_chat(t, voice_mode=False))
+        self._chat.voice_session_toggled.connect(self._on_voice_toggled)
+        self._chat.set_context_actions(
+            [self._clear_action, self._tts_action, self._stop_tts_action]
+        )
+        side.addWidget(self._chat, stretch=1)
+
+        splitter.addWidget(workspace)
+        splitter.addWidget(sidebar)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([860, 400])
+        layout.addWidget(splitter, stretch=1)
+
+    def _build_top_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("topBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(8)
+
+        mark = QLabel("助")
+        mark.setObjectName("appMark")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(28, 28)
+        title = QLabel("学习助手")
+        title.setObjectName("appTitle")
+        row.addWidget(mark)
+        row.addWidget(title)
+
+        self._port_chip = QLabel("未连接开发板")
+        self._port_chip.setObjectName("sessionChip")
+        self._port_chip.setProperty("connected", False)
+        self._port_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._port_chip.customContextMenuRequested.connect(self._show_hardware_menu)
+        row.addWidget(self._port_chip)
+        row.addStretch(1)
+
+        for text, menu, icon in (
+            ("项目", self._project_menu, icon_project()),
+            ("硬件", self._hardware_menu, icon_hardware()),
+            ("摄像头", self._camera_menu, icon_camera()),
+            ("语音", self._voice_menu, icon_voice()),
+            ("视图", self._view_menu, icon_view()),
+        ):
+            button = QToolButton()
+            button.setObjectName("toolbarButton")
+            button.setText(f"{text}  ▾")
+            button.setIcon(with_label_gap(icon, 8))
+            button.setIconSize(QSize(24, 16))
+            button.setMenu(menu)
+            button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            row.addWidget(button)
+        return bar
+
+    def _show_camera_menu(self, pos) -> None:
+        self._camera_menu.exec(self._camera_widget.mapToGlobal(pos))
+
+    def _show_hardware_menu(self, pos) -> None:
+        self._hardware_menu.exec(self._port_chip.mapToGlobal(pos))
+
+    def _build_menus(self) -> None:
+        self._camera_placeholders: list[QAction] = []
+        self._port_placeholders: list[QAction] = []
+        self._preferred_port = ""
+
+        self.menuBar().hide()
+
+        project = ThemedMenu(self)
+        project.setObjectName("appMenu")
+        next_action = project.addAction(icon_next(), "下一步")
+        next_action.setToolTip("手动进入下一教学步骤")
+        next_action.triggered.connect(self._advance_step)
+        self._clear_action = project.addAction(icon_clear(), "清空对话")
+        self._clear_action.setToolTip("清除与助手的多轮记忆")
+        self._clear_action.triggered.connect(self._clear_dialog)
+        self._project_menu = project
+
+        view = ThemedMenu(self)
+        view.setObjectName("appMenu")
+        self._show_log_action = view.addAction(icon_log(), "编译与烧录")
+        self._show_log_action.setCheckable(True)
+        self._show_log_action.setChecked(False)
+        self._show_log_action.setToolTip("显示或隐藏编译与烧录日志")
+        self._show_log_action.toggled.connect(self._set_log_visible)
+        self._view_menu = view
+
+        self._hardware_menu = ThemedMenu(self)
+        self._hardware_menu.setObjectName("appMenu")
+        refresh_boards = self._hardware_menu.addAction(icon_refresh(), "刷新开发板")
+        refresh_boards.setToolTip("重新扫描已连接的 Arduino 开发板")
+        refresh_boards.triggered.connect(self._refresh_boards)
+        self._hardware_menu.addSeparator()
+        self._port_insert_before = self._hardware_menu.addSeparator()
+        upload_action = self._hardware_menu.addAction(icon_upload(), "烧录 Blink")
+        upload_action.setToolTip("编译并上传 Blink 示例到所选串口")
+        upload_action.triggered.connect(self._upload_blink)
+        self._port_group = QActionGroup(self)
+        self._port_group.setExclusive(True)
+
+        self._camera_menu = ThemedMenu(self)
+        self._camera_menu.setObjectName("appMenu")
+        refresh_cameras = self._camera_menu.addAction(icon_refresh(), "刷新")
+        refresh_cameras.setToolTip("重新扫描本机摄像头")
+        refresh_cameras.triggered.connect(self._refresh_cameras)
+        self._camera_menu.addSeparator()
+        self._camera_group = QActionGroup(self)
+        self._camera_group.setExclusive(True)
+        self._camera_group.triggered.connect(self._on_camera_changed)
+
+        voice = ThemedMenu(self)
+        voice.setObjectName("appMenu")
+        self._asr_group = QActionGroup(self)
+        self._asr_group.setExclusive(True)
+        self._asr_local = voice.addAction(icon_local(), "本地 Whisper")
+        self._asr_local.setCheckable(True)
+        self._asr_local.setData("local")
+        self._asr_local.setToolTip("faster-whisper（CPU）")
+        self._asr_remote = voice.addAction(icon_remote(), "远程 Ollama")
+        self._asr_remote.setCheckable(True)
+        self._asr_remote.setData("remote")
+        self._asr_remote.setToolTip("Ollama qwen3-asr（见 .env）")
+        self._asr_group.addAction(self._asr_local)
+        self._asr_group.addAction(self._asr_remote)
+        if self._settings.asr_backend == "remote":
+            self._asr_remote.setChecked(True)
+        else:
+            self._asr_local.setChecked(True)
+        self._asr_group.triggered.connect(self._on_asr_mode_changed)
+        voice.addSeparator()
+        self._tts_action = voice.addAction(icon_speaker(), "语音回复")
+        self._tts_action.setCheckable(True)
+        self._tts_action.setChecked(self._settings.tts_enabled)
+        self._tts_action.setToolTip("文字提问后朗读回复。语音辅导会话中总会朗读。")
+        self._stop_tts_action = voice.addAction(icon_stop(), "停止朗读")
+        self._stop_tts_action.triggered.connect(self._tts.stop)
+        self._voice_menu = voice
+
+    def _set_log_visible(self, visible: bool) -> None:
+        self._log_panel.setVisible(visible)
+        if self._show_log_action.isChecked() != visible:
+            self._show_log_action.blockSignals(True)
+            self._show_log_action.setChecked(visible)
+            self._show_log_action.blockSignals(False)
 
     def _clear_dialog(self) -> None:
         self._dialog_history.clear()
         self._chat.append_system("已清空对话记忆")
 
     def _tts_on(self) -> bool:
-        return self._tts_enabled.isChecked()
+        return self._tts_action.isChecked()
 
     def _should_speak_reply(self, voice_mode: bool) -> bool:
         return self._tts_on() or voice_mode
@@ -475,12 +603,9 @@ class MainWindow(QMainWindow):
             return
         self._chat.append_system(msg)
 
-    def _seed_camera_combo(self) -> None:
+    def _seed_camera_menu(self) -> None:
         index = int(self._settings.camera_index)
-        self._camera_combo.blockSignals(True)
-        self._camera_combo.clear()
-        self._camera_combo.addItem(f"摄像头 {index}", index)
-        self._camera_combo.blockSignals(False)
+        self._replace_camera_actions([(index, f"摄像头 {index}")], pick=index)
 
     def _start_llm_connect(self) -> None:
         self._llm_connect_worker = LLMConnectWorker()
@@ -496,50 +621,123 @@ class MainWindow(QMainWindow):
         self._chat.append_system(msg if ok else f"警告: {msg}")
 
     def _selected_camera_index(self) -> int:
-        data = self._camera_combo.currentData()
-        if data is not None and data != "":
-            return int(data)
+        action = self._camera_group.checkedAction()
+        if action is not None and action.data() not in (None, ""):
+            return int(action.data())
         return get_settings().camera_index
+
+    def _replace_camera_actions(self, entries: list[tuple[object, str]], pick: object = None) -> None:
+        self._camera_group.blockSignals(True)
+        for action in list(self._camera_group.actions()):
+            self._camera_group.removeAction(action)
+            self._camera_menu.removeAction(action)
+            action.deleteLater()
+        for action in self._camera_placeholders:
+            self._camera_menu.removeAction(action)
+            action.deleteLater()
+        self._camera_placeholders.clear()
+
+        chosen: QAction | None = None
+        for data, label in entries:
+            if data in (None, ""):
+                placeholder = QAction(icon_camera(), label, self)
+                placeholder.setEnabled(False)
+                self._camera_menu.addAction(placeholder)
+                self._camera_placeholders.append(placeholder)
+                continue
+            action = QAction(icon_camera(), label, self)
+            action.setCheckable(True)
+            action.setData(data)
+            self._camera_group.addAction(action)
+            self._camera_menu.addAction(action)
+            if pick is not None and data == pick:
+                chosen = action
+        if chosen is None and self._camera_group.actions():
+            chosen = self._camera_group.actions()[0]
+        if chosen is not None:
+            chosen.setChecked(True)
+        self._camera_group.blockSignals(False)
 
     def _refresh_cameras(self) -> None:
         preferred = self._selected_camera_index()
-        self._camera_combo.blockSignals(True)
-        self._camera_combo.clear()
         try:
             devices = list_cameras()
-            for index, label in devices:
-                self._camera_combo.addItem(label, index)
             if not devices:
-                self._camera_combo.addItem("未检测到摄像头", "")
+                self._replace_camera_actions([("", "未检测到摄像头")])
                 self._chat.append_system("未检测到可用摄像头")
             else:
-                pick = preferred
-                if not any(i == pick for i, _ in devices):
-                    pick = devices[0][0]
-                idx = self._camera_combo.findData(pick)
-                if idx >= 0:
-                    self._camera_combo.setCurrentIndex(idx)
+                pick = preferred if any(index == preferred for index, _ in devices) else devices[0][0]
+                self._replace_camera_actions(list(devices), pick=pick)
         except Exception as exc:  # noqa: BLE001
-            self._camera_combo.addItem(f"扫描失败: {exc}", "")
+            self._replace_camera_actions([("", f"扫描失败: {exc}")])
             self._chat.append_system(f"摄像头扫描: {exc}")
-        finally:
-            self._camera_combo.blockSignals(False)
         if hasattr(self, "_camera"):
             self._on_camera_changed()
 
-    def _on_camera_changed(self) -> None:
+    def _on_camera_changed(self, _action: QAction | None = None) -> None:
         if not hasattr(self, "_camera"):
             return
-        index = self._camera_combo.currentData()
-        if index is None or index == "":
+        checked = self._camera_group.checkedAction()
+        if checked is None or checked.data() in (None, ""):
             return
-        self._camera.set_camera_index(int(index))
+        self._camera.set_camera_index(int(checked.data()))
+
+    def _replace_port_actions(self, entries: list[tuple[object, str]], pick: str = "") -> None:
+        self._port_group.blockSignals(True)
+        for action in list(self._port_group.actions()):
+            self._port_group.removeAction(action)
+            self._hardware_menu.removeAction(action)
+            action.deleteLater()
+        for action in self._port_placeholders:
+            self._hardware_menu.removeAction(action)
+            action.deleteLater()
+        self._port_placeholders.clear()
+
+        chosen: QAction | None = None
+        for data, label in entries:
+            if not data:
+                placeholder = QAction(icon_hardware(), label, self)
+                placeholder.setEnabled(False)
+                self._hardware_menu.insertAction(self._port_insert_before, placeholder)
+                self._port_placeholders.append(placeholder)
+                continue
+            action = QAction(icon_hardware(), label, self)
+            action.setCheckable(True)
+            action.setData(data)
+            self._port_group.addAction(action)
+            self._hardware_menu.insertAction(self._port_insert_before, action)
+            if pick and data == pick:
+                chosen = action
+        if chosen is None and self._port_group.actions():
+            chosen = self._port_group.actions()[0]
+        if chosen is not None:
+            chosen.setChecked(True)
+        self._port_group.blockSignals(False)
+        self._sync_port_chip()
+
+    def _sync_port_chip(self) -> None:
+        if not hasattr(self, "_port_chip"):
+            return
+        action = self._port_group.checkedAction()
+        port = action.data() if action is not None else ""
+        if port:
+            self._port_chip.setText(f"●  {port}")
+            self._port_chip.setToolTip(action.text())
+            connected = True
+        else:
+            text = self._port_placeholders[-1].text() if self._port_placeholders else "未连接开发板"
+            self._port_chip.setText(text)
+            self._port_chip.setToolTip("")
+            connected = False
+        self._port_chip.setProperty("connected", connected)
+        self._port_chip.style().unpolish(self._port_chip)
+        self._port_chip.style().polish(self._port_chip)
 
     def _refresh_boards(self) -> None:
         if self._board_worker is not None and self._board_worker.isRunning():
             return
-        self._port_combo.clear()
-        self._port_combo.addItem("正在扫描…", "")
+        self._preferred_port = self._selected_port()
+        self._replace_port_actions([("", "正在扫描…")])
         self._board_worker = BoardScanWorker()
         _keep_alive(self._board_worker)
         self._board_worker.succeeded.connect(self._on_boards_ready)
@@ -550,46 +748,49 @@ class MainWindow(QMainWindow):
     def _on_boards_ready(self, boards: object) -> None:
         if self._closing:
             return
-        preferred = self._selected_port()
-        self._port_combo.clear()
-        for board in boards:
-            self._port_combo.addItem(f"{board.port} ({board.label})", board.port)
+        preferred = self._preferred_port
         if not boards:
-            self._port_combo.addItem("未检测到开发板", "")
+            self._replace_port_actions([("", "未检测到开发板")])
             return
-        if preferred:
-            idx = self._port_combo.findData(preferred)
-            if idx >= 0:
-                self._port_combo.setCurrentIndex(idx)
+        entries = [(board.port, f"{board.port} ({board.label})") for board in boards]
+        pick = preferred if any(board.port == preferred for board in boards) else entries[0][0]
+        self._replace_port_actions(entries, pick=pick)
 
     @Slot(str)
     def _on_boards_failed(self, msg: str) -> None:
         if self._closing:
             return
-        self._port_combo.clear()
-        self._port_combo.addItem("无法列出串口", "")
+        self._replace_port_actions([("", "无法列出串口")])
         self._chat.append_system(f"硬件连接: {msg}")
 
     def _selected_port(self) -> str:
-        return self._port_combo.currentData() or ""
+        action = self._port_group.checkedAction()
+        if action is None:
+            return ""
+        return action.data() or ""
 
     def _upload_blink(self) -> None:
+        self._set_log_visible(True)
         self._agent_ctx.selected_port = self._selected_port()
         log = self._handlers["compile_and_upload"](sketch_name="blink", port=self._agent_ctx.selected_port)
         self._monitor.append(log)
         self._chat.append_system(log[:500])
 
+    def _selected_asr_backend(self) -> AsrBackend:
+        if self._asr_remote.isChecked():
+            return "remote"
+        return "local"
+
     def _asr_mode_label(self) -> str:
-        backend = self._asr_combo.currentData() if hasattr(self, "_asr_combo") else self._settings.asr_backend
-        if backend == "remote":
+        if self._selected_asr_backend() == "remote":
             return (
                 f"ASR：远程 Ollama（{self._settings.ollama_asr_model} @ "
                 f"{self._settings.resolve_ollama_base_url()}）"
             )
         return f"ASR：本地 Whisper（{self._settings.whisper_model_size}）"
 
-    def _on_asr_mode_changed(self) -> None:
-        backend: AsrBackend = self._asr_combo.currentData() or "local"
+    def _on_asr_mode_changed(self, _action: QAction | None = None) -> None:
+        backend = self._selected_asr_backend()
         self._asr = create_asr(self._settings, backend=backend)
         self._chat.append_system(self._asr_mode_label())
 
@@ -752,7 +953,7 @@ class MainWindow(QMainWindow):
         if not self._voice_active and self._llm_worker is not None and self._llm_worker.isRunning():
             self._chat.append_system("助手仍在回复上一问，请稍候")
             return
-        self._start_llm(text, voice_mode=voice_mode, stream=self._voice_active)
+        self._start_llm(text, voice_mode=voice_mode, stream=True)
 
     def _start_llm(self, text: str, voice_mode: bool, stream: bool) -> None:
         self._agent_ctx.selected_port = self._selected_port()
@@ -762,6 +963,7 @@ class MainWindow(QMainWindow):
         turn = self._turn
         self._sentence_buf.clear()
         self._voice_streamed = False
+        self._answer_shown = False
         if self._voice_active:
             self._voice_phase = "thinking"
             self._chat.set_voice_status("老师在想")
@@ -781,19 +983,30 @@ class MainWindow(QMainWindow):
         )
         _keep_alive(self._llm_worker)
         self._llm_worker.delta.connect(self._on_llm_delta)
+        self._llm_worker.reasoning.connect(self._on_llm_reasoning)
         self._llm_worker.revoke.connect(self._on_llm_revoke)
         self._llm_worker.succeeded.connect(self._on_llm_reply)
         self._llm_worker.failed.connect(self._on_llm_failed)
-        if not self._voice_active:
-            self._chat.append_system("思考中…")
+        self._chat.begin_thinking()
         self._llm_worker.start()
 
     @Slot(int, str)
-    def _on_llm_delta(self, turn: int, text: str) -> None:
-        if turn != self._turn:
+    def _on_llm_reasoning(self, turn: int, text: str) -> None:
+        if turn != self._turn or not text:
             return
-        for sentence in self._sentence_buf.push(text):
-            self._emit_spoken_sentence(sentence)
+        self._chat.append_thinking(text)
+
+    @Slot(int, str)
+    def _on_llm_delta(self, turn: int, text: str) -> None:
+        if turn != self._turn or not text:
+            return
+        self._chat.finish_thinking()
+        if self._pending_voice_mode:
+            for sentence in self._sentence_buf.push(text):
+                self._emit_spoken_sentence(sentence)
+            return
+        self._answer_shown = True
+        self._chat.append_assistant_chunk(text)
 
     def _emit_spoken_sentence(self, sentence: str) -> None:
         self._voice_streamed = True
@@ -817,7 +1030,9 @@ class MainWindow(QMainWindow):
         self._tts.stop()
         self._sentence_buf.clear()
         self._voice_streamed = False
+        self._answer_shown = False
         self._chat.discard_assistant_stream()
+        self._chat.reopen_thinking()
         if self._voice_active:
             self._voice_phase = "thinking"
             self._chat.set_voice_status("老师在想")
@@ -843,6 +1058,8 @@ class MainWindow(QMainWindow):
             if rest:
                 self._emit_spoken_sentence(rest)
             if reply.strip() and not self._voice_streamed:
+                if reply.strip() == self._chat.thinking_text().strip():
+                    self._chat.discard_thinking()
                 self._emit_spoken_sentence(reply.strip())
             self._chat.end_assistant_stream()
             if reply.strip():
@@ -856,7 +1073,19 @@ class MainWindow(QMainWindow):
                 self._enter_listening()
             return
 
-        self._chat.append_assistant(reply)
+        if self._answer_shown:
+            self._chat.finish_thinking()
+            if reply.strip():
+                self._chat.set_stream_text(reply.strip())
+            self._chat.end_assistant_stream()
+        else:
+            thinking = self._chat.thinking_text().strip()
+            if reply.strip() and reply.strip() == thinking:
+                self._chat.discard_thinking()
+            else:
+                self._chat.finish_thinking()
+            if reply.strip():
+                self._chat.append_assistant(reply)
         self._remember_turn(reply)
         if self._should_speak_reply(self._pending_voice_mode):
             spoken = spoken_text_from_reply(reply, self._pending_voice_mode)
@@ -882,7 +1111,7 @@ class MainWindow(QMainWindow):
         self._turn += 1
         if hasattr(self, "_voice_session"):
             self._voice_session.stop()
-        self._tts.stop()
+        self._tts.close()
         self._camera.stop()
         self._camera.wait(2000)
         for worker in (

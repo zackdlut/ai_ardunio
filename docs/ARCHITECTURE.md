@@ -569,7 +569,7 @@ sequenceDiagram
 
 **TTS**
 
-1. 侧栏「语音回复」开启后，`_on_llm_reply` 调用 `spoken_text_from_reply`；语音提问时优先朗读 `【朗读】` 段。
+1. 菜单「语音 → 语音回复」开启后，`_on_llm_reply` 调用 `spoken_text_from_reply`；语音提问时优先朗读 `【朗读】` 段。
 2. `create_tts()` → 本机 pyttsx3/SAPI（`TTS_VOICE`、`TTS_RATE`）；可「停止朗读」，按住 PTT 会 `stop()`。
 
 **导师旁路**
