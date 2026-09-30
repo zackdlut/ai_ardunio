@@ -9,6 +9,10 @@ from agent.prompts import SYSTEM_PROMPT
 from config.settings import get_settings
 
 
+class _StreamInterrupted(Exception):
+    """Raised when a voice turn is cancelled mid-stream."""
+
+
 class LLMClient:
     def __init__(self) -> None:
         settings = get_settings()
@@ -38,6 +42,7 @@ class LLMClient:
         voice_mode: bool = False,
         max_rounds: int = 6,
         max_history_messages: int = 20,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         system_content = SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
         prior = list(history or [])[-max_history_messages:]
@@ -51,6 +56,8 @@ class LLMClient:
             completion_kwargs["max_tokens"] = 512
 
         for _ in range(max_rounds):
+            if should_stop and should_stop():
+                return ""
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
@@ -88,6 +95,8 @@ class LLMClient:
             )
 
             for tc in tool_calls:
+                if should_stop and should_stop():
+                    return ""
                 name = tc.function.name
                 args = json.loads(tc.function.arguments or "{}")
                 handler = tool_handlers.get(name)
@@ -104,3 +113,188 @@ class LLMClient:
                 )
 
         return "（达到工具调用轮次上限，请重试或简化问题）"
+
+    def chat_with_tools_stream(
+        self,
+        user_message: str,
+        tools: list[dict[str, Any]],
+        tool_handlers: dict[str, Callable[..., str]],
+        extra_system: str = "",
+        history: list[dict[str, str]] | None = None,
+        voice_mode: bool = False,
+        max_rounds: int = 6,
+        max_history_messages: int = 20,
+        on_delta: Callable[[str], None] | None = None,
+        on_revoke: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> str:
+        """Stream the spoken answer. Tool rounds stay silent; early speech is revoked."""
+        system_content = SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
+        prior = list(history or [])[-max_history_messages:]
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_content},
+            *prior,
+            {"role": "user", "content": user_message},
+        ]
+        completion_kwargs: dict[str, Any] = {}
+        if voice_mode:
+            completion_kwargs["max_tokens"] = 512
+
+        try:
+            return self._run_stream_rounds(
+                messages,
+                tools,
+                tool_handlers,
+                completion_kwargs,
+                max_rounds,
+                on_delta,
+                on_revoke,
+                should_stop,
+            )
+        except _StreamInterrupted:
+            return ""
+
+    def _run_stream_rounds(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_handlers: dict[str, Callable[..., str]],
+        completion_kwargs: dict[str, Any],
+        max_rounds: int,
+        on_delta: Callable[[str], None] | None,
+        on_revoke: Callable[[], None] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> str:
+        for _ in range(max_rounds):
+            if should_stop and should_stop():
+                raise _StreamInterrupted
+            content, tool_calls = self._stream_completion(
+                messages,
+                tools,
+                completion_kwargs,
+                on_delta=on_delta,
+                on_revoke=on_revoke,
+                should_stop=should_stop,
+            )
+            if not tool_calls:
+                return content
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": slot["id"],
+                            "type": "function",
+                            "function": {
+                                "name": slot["name"],
+                                "arguments": slot["arguments"] or "{}",
+                            },
+                        }
+                        for slot in tool_calls
+                    ],
+                }
+            )
+            for slot in tool_calls:
+                if should_stop and should_stop():
+                    raise _StreamInterrupted
+                name = slot["name"]
+                try:
+                    args = json.loads(slot["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    result = f"工具参数无法解析: {name}"
+                else:
+                    handler = tool_handlers.get(name)
+                    if handler:
+                        result = handler(**args)
+                    else:
+                        result = f"Unknown tool: {name}"
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": slot["id"],
+                        "content": result,
+                    }
+                )
+
+        return "（达到工具调用轮次上限，请重试或简化问题）"
+
+    def _stream_completion(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        completion_kwargs: dict[str, Any],
+        on_delta: Callable[[str], None] | None,
+        on_revoke: Callable[[], None] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> tuple[str, list[dict[str, str]] | None]:
+        stream = self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            tools=tools if tools else None,
+            stream=True,
+            **completion_kwargs,
+        )
+        content_parts: list[str] = []
+        tool_acc: dict[int, dict[str, str]] = {}
+        emitted = False
+        saw_tool = False
+        try:
+            for chunk in stream:
+                if should_stop and should_stop():
+                    raise _StreamInterrupted
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+                piece = getattr(delta, "content", None) or ""
+                if piece and not saw_tool:
+                    content_parts.append(piece)
+                    if on_delta is not None:
+                        on_delta(piece)
+                        emitted = True
+                tool_deltas = getattr(delta, "tool_calls", None) or []
+                if tool_deltas:
+                    if emitted and not saw_tool and on_revoke is not None:
+                        on_revoke()
+                    saw_tool = True
+                    emitted = False
+                    _merge_tool_call_deltas(tool_acc, tool_deltas)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        content = "".join(content_parts).strip()
+        if not saw_tool:
+            return content, None
+        ordered = [tool_acc[index] for index in sorted(tool_acc)]
+        return content, ordered
+
+
+def _merge_tool_call_deltas(acc: dict[int, dict[str, str]], deltas: Any) -> None:
+    for fallback, delta in enumerate(deltas):
+        index = getattr(delta, "index", None)
+        slot_index = fallback if index is None else int(index)
+        slot = acc.setdefault(
+            slot_index, {"id": "", "name": "", "arguments": ""}
+        )
+        call_id = getattr(delta, "id", None)
+        if call_id:
+            slot["id"] = call_id
+        function = getattr(delta, "function", None)
+        if function is None:
+            continue
+        name = getattr(function, "name", None)
+        if name:
+            slot["name"] += name
+        arguments = getattr(function, "arguments", None)
+        if arguments:
+            slot["arguments"] += arguments
+        if not slot["id"]:
+            slot["id"] = f"call_{slot_index}"

@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     tts_voice: str = Field(default="Microsoft Huihui Desktop", alias="TTS_VOICE")
     tts_rate: int = Field(default=180, alias="TTS_RATE")
 
+    vad_noise_multiplier: float = Field(default=2.2, alias="VAD_NOISE_MULTIPLIER")
+    vad_barge_noise_multiplier: float = Field(default=6.0, alias="VAD_BARGE_NOISE_MULTIPLIER")
+    vad_min_rms: float = Field(default=0.004, alias="VAD_MIN_RMS")
+    vad_barge_min_rms: float = Field(default=0.05, alias="VAD_BARGE_MIN_RMS")
+    vad_onset_ms: int = Field(default=250, alias="VAD_ONSET_MS")
+    vad_barge_ms: int = Field(default=200, alias="VAD_BARGE_MS")
+    vad_silence_ms: int = Field(default=800, alias="VAD_SILENCE_MS")
+    vad_min_speech_ms: int = Field(default=300, alias="VAD_MIN_SPEECH_MS")
+    vad_max_utterance_s: float = Field(default=20.0, alias="VAD_MAX_UTTERANCE_S")
+    vad_preroll_ms: int = Field(default=300, alias="VAD_PREROLL_MS")
+    vad_barge_grace_ms: int = Field(default=800, alias="VAD_BARGE_GRACE_MS")
+
     arduino_fqbn: str = Field(default="arduino:avr:uno", alias="ARDUINO_FQBN")
     arduino_cli: str = Field(default="arduino-cli", alias="ARDUINO_CLI")
     camera_index: int = Field(default=0, alias="CAMERA_INDEX")

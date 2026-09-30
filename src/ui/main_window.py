@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PySide6.QtCore import QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -30,12 +29,13 @@ from ui.camera_worker import CameraWorker
 from ui.camera_widget import CameraWidget
 from ui.chat_widget import ChatWidget
 from voice.asr import AsrBackend, create_asr
+from voice.sentences import SentenceBuffer
+from voice.session import VoiceSession
 from voice.tts import create_tts, prepare_speech_text, spoken_text_from_reply
 
 if TYPE_CHECKING:
     from agent.llm_client import LLMClient
 
-PROACTIVE_COOLDOWN_S = 30.0
 _BACKGROUND_THREADS: list[QThread] = []
 
 
@@ -52,27 +52,39 @@ def _keep_alive(thread: QThread) -> None:
     thread.finished.connect(_release)
 
 
-class ASRWorker(QThread):
-    finished = Signal(str)
+class _TtsBridge(QObject):
+    idle = Signal()
     failed = Signal(str)
 
-    def __init__(self, asr, audio: np.ndarray, sample_rate: int) -> None:
+
+class ASRWorker(QThread):
+    succeeded = Signal(int, str)
+    failed = Signal(int, str)
+
+    def __init__(self, asr, audio: np.ndarray, sample_rate: int, turn: int) -> None:
         super().__init__()
         self._asr = asr
         self._audio = audio
         self._sample_rate = sample_rate
+        self._turn = turn
 
     def run(self) -> None:
+        if self.isInterruptionRequested():
+            return
         try:
             text = self._asr.transcribe_pcm(self._audio, self._sample_rate)
-            self.finished.emit(text)
+            if not self.isInterruptionRequested():
+                self.succeeded.emit(self._turn, text)
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+            if not self.isInterruptionRequested():
+                self.failed.emit(self._turn, str(exc))
 
 
 class LLMWorker(QThread):
-    finished = Signal(str)
-    failed = Signal(str)
+    delta = Signal(int, str)
+    revoke = Signal(int)
+    succeeded = Signal(int, str)
+    failed = Signal(int, str)
 
     def __init__(
         self,
@@ -83,6 +95,8 @@ class LLMWorker(QThread):
         history: list[dict[str, str]],
         extra_system: str,
         voice_mode: bool,
+        turn: int,
+        stream: bool,
     ) -> None:
         super().__init__()
         self._client = client
@@ -92,20 +106,40 @@ class LLMWorker(QThread):
         self._history = history
         self._extra_system = extra_system
         self._voice_mode = voice_mode
+        self._turn = turn
+        self._stream = stream
 
     def run(self) -> None:
+        if self.isInterruptionRequested():
+            return
         try:
-            reply = self._client.chat_with_tools(
-                self._message,
-                self._tools,
-                self._handlers,
-                extra_system=self._extra_system,
-                history=self._history,
-                voice_mode=self._voice_mode,
-            )
-            self.finished.emit(reply)
+            if self._stream:
+                reply = self._client.chat_with_tools_stream(
+                    self._message,
+                    self._tools,
+                    self._handlers,
+                    extra_system=self._extra_system,
+                    history=self._history,
+                    voice_mode=self._voice_mode,
+                    on_delta=lambda text: self.delta.emit(self._turn, text),
+                    on_revoke=lambda: self.revoke.emit(self._turn),
+                    should_stop=self.isInterruptionRequested,
+                )
+            else:
+                reply = self._client.chat_with_tools(
+                    self._message,
+                    self._tools,
+                    self._handlers,
+                    extra_system=self._extra_system,
+                    history=self._history,
+                    voice_mode=self._voice_mode,
+                    should_stop=self.isInterruptionRequested,
+                )
+            if not self.isInterruptionRequested():
+                self.succeeded.emit(self._turn, reply)
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+            if not self.isInterruptionRequested():
+                self.failed.emit(self._turn, str(exc))
 
 
 class BoardScanWorker(QThread):
@@ -178,12 +212,15 @@ class MainWindow(QMainWindow):
         self._board_worker: BoardScanWorker | None = None
         self._llm_connect_worker: LLMConnectWorker | None = None
         self._closing = False
-        self._recording: list[np.ndarray] = []
-        self._sample_rate = 16000
         self._dialog_history: list[dict[str, str]] = []
         self._pending_user_text = ""
         self._pending_voice_mode = False
-        self._last_proactive_ts = 0.0
+        self._turn = 0
+        self._voice_active = False
+        self._voice_phase = "idle"
+        self._syncing_voice_btn = False
+        self._sentence_buf = SentenceBuffer()
+        self._voice_streamed = False
 
         self._build_ui()
         self._seed_camera_combo()
@@ -197,6 +234,18 @@ class MainWindow(QMainWindow):
         self._camera.status_message.connect(self._on_camera_status)
         self._camera.start()
         self._camera_combo.currentIndexChanged.connect(self._on_camera_changed)
+
+        self._voice_session = VoiceSession(self._settings, self)
+        self._voice_session.utterance_ready.connect(self._on_utterance)
+        self._voice_session.speech_started.connect(self._on_speech_started)
+        self._voice_session.barge_in.connect(self._on_barge_in)
+        self._voice_session.capture_rejected.connect(self._on_capture_rejected)
+        self._voice_session.error.connect(self._on_voice_error)
+        self._tts_bridge = _TtsBridge(self)
+        self._tts.set_idle_callback(self._tts_bridge.idle.emit)
+        self._tts.set_error_callback(self._tts_bridge.failed.emit)
+        self._tts_bridge.idle.connect(self._on_tts_idle)
+        self._tts_bridge.failed.connect(self._on_tts_failed)
 
         self._apply_overlay_from_step()
         self._start_llm_connect()
@@ -298,7 +347,7 @@ class MainWindow(QMainWindow):
         tts_row.setSpacing(8)
         self._tts_enabled = QCheckBox("语音回复")
         self._tts_enabled.setChecked(self._settings.tts_enabled)
-        self._tts_enabled.setToolTip("助手回复后用本机中文朗读（可停止）")
+        self._tts_enabled.setToolTip("文字提问后朗读回复。语音辅导会话中总会朗读。")
         stop_tts_btn = QPushButton("停止朗读")
         stop_tts_btn.clicked.connect(self._tts.stop)
         tts_row.addWidget(self._tts_enabled)
@@ -327,8 +376,7 @@ class MainWindow(QMainWindow):
 
         self._chat = ChatWidget()
         self._chat.send_requested.connect(lambda t: self._on_chat(t, voice_mode=False))
-        self._chat.voice_ptt_pressed.connect(self._start_voice)
-        self._chat.voice_ptt_released.connect(self._stop_voice)
+        self._chat.voice_session_toggled.connect(self._on_voice_toggled)
         layout.addWidget(self._chat, stretch=3)
 
         log_panel = QFrame()
@@ -360,17 +408,7 @@ class MainWindow(QMainWindow):
         if not text.strip():
             return
         if force or self._tts_on():
-            self._tts.speak(
-                prepare_speech_text(text),
-                on_error=lambda e: self._chat.append_system(f"TTS 失败: {e}"),
-            )
-
-    def _agent_busy(self) -> bool:
-        if self._llm_worker is not None and self._llm_worker.isRunning():
-            return True
-        if self._asr_worker is not None and self._asr_worker.isRunning():
-            return True
-        return False
+            self._tts.speak(prepare_speech_text(text))
 
     def _extra_system_for_chat(self, voice_mode: bool) -> str:
         return build_extra_system(
@@ -388,20 +426,6 @@ class MainWindow(QMainWindow):
         self._verify_ok = ok
         self._verify_msg = msg
         self._step_hint.setToolTip(msg)
-
-        if ok or self._agent_busy():
-            return
-        now = time.monotonic()
-        if now - self._last_proactive_ts < PROACTIVE_COOLDOWN_S:
-            return
-        self._last_proactive_ts = now
-        step = self._state_machine.current_step
-        tip = (
-            f"导师提醒：{msg} 请按当前步骤操作——{step.hint}。"
-            "看不清或识别不准可以调整摄像头或语音问我。"
-        )
-        self._chat.append_system(tip)
-        self._speak_if_enabled(step.hint)
 
     def _on_gesture(self, cmd: str) -> None:
         if cmd == "next":
@@ -434,7 +458,11 @@ class MainWindow(QMainWindow):
         p = self._state_machine.progress()
         hint = p["current_hint"]
         self._chat.append_system(f"进入步骤：{p['current_step']} — {hint}")
-        self._speak_if_enabled(hint)
+        if self._voice_active:
+            self._cancel_inflight()
+            self._speak_in_session(hint)
+        else:
+            self._speak_if_enabled(hint)
 
     def _advance_step(self) -> None:
         if self._state_machine.advance():
@@ -565,101 +593,304 @@ class MainWindow(QMainWindow):
         self._asr = create_asr(self._settings, backend=backend)
         self._chat.append_system(self._asr_mode_label())
 
-    def _start_voice(self) -> None:
-        self._tts.stop()
-        if self._asr_worker is not None and self._asr_worker.isRunning():
-            self._chat.append_system("上一段语音仍在识别中，请稍候")
+    def _on_voice_toggled(self, active: bool) -> None:
+        if self._syncing_voice_btn:
             return
-        try:
-            import sounddevice as sd
-
-            self._recording = []
-            self._stream = sd.InputStream(
-                samplerate=self._sample_rate,
-                channels=1,
-                callback=self._audio_callback,
-            )
-            self._stream.start()
-            self._chat.append_system("录音中…")
-        except Exception as exc:  # noqa: BLE001
-            self._chat.append_system(f"麦克风不可用: {exc}")
-
-    def _audio_callback(self, indata, frames, time, status) -> None:  # noqa: ARG001
-        self._recording.append(indata.copy())
-
-    def _stop_voice(self) -> None:
-        if hasattr(self, "_stream"):
-            self._stream.stop()
-            self._stream.close()
-        if not self._recording:
-            return
-        audio = np.concatenate(self._recording, axis=0).flatten().astype(np.float32)
-        self._chat.append_system("识别中…")
-        self._asr_worker = ASRWorker(self._asr, audio, self._sample_rate)
-        self._asr_worker.finished.connect(self._on_asr_finished)
-        self._asr_worker.failed.connect(
-            lambda exc: self._chat.append_system(f"ASR 失败: {exc}")
-        )
-        self._asr_worker.start()
-
-    @Slot(str)
-    def _on_asr_finished(self, text: str) -> None:
-        if text:
-            self._chat.append_user(text)
-            self._on_chat(text, voice_mode=True)
+        if active:
+            self._start_voice_session()
         else:
-            self._chat.append_system("未识别到语音")
+            self._stop_voice_session()
 
-    def _on_chat(self, text: str, voice_mode: bool = False) -> None:
-        if self._llm is None:
-            self._chat.append_system("助手仍在连接，请稍候")
+    def _set_voice_button(self, active: bool) -> None:
+        self._syncing_voice_btn = True
+        self._chat.set_voice_checked(active)
+        self._syncing_voice_btn = False
+
+    def _start_voice_session(self) -> None:
+        self._cancel_inflight()
+        try:
+            self._voice_session.start()
+        except Exception as exc:  # noqa: BLE001
+            self._voice_active = False
+            self._voice_phase = "idle"
+            self._set_voice_button(False)
+            self._chat.set_voice_status("")
+            self._chat.append_system(f"麦克风不可用: {exc}")
+            return
+        self._voice_active = True
+        self._enter_listening()
+
+    def _stop_voice_session(self) -> None:
+        self._voice_active = False
+        self._voice_phase = "idle"
+        self._cancel_inflight()
+        self._voice_session.stop()
+        self._chat.end_assistant_stream()
+        self._chat.set_voice_status("")
+        self._set_voice_button(False)
+
+    def _enter_listening(self) -> None:
+        if not self._voice_active:
+            return
+        self._voice_phase = "listening"
+        self._chat.set_voice_status("在听，请说话")
+        self._voice_session.set_mode("listen")
+
+    def _cancel_inflight(self) -> None:
+        self._turn += 1
+        self._sentence_buf.clear()
+        self._tts.stop()
+        for worker in (self._llm_worker, self._asr_worker):
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+
+    def _speak_in_session(self, text: str) -> None:
+        spoken = prepare_speech_text(text)
+        if not spoken or not self._voice_active:
+            return
+        self._voice_phase = "speaking"
+        self._chat.set_voice_status("讲解中")
+        self._voice_session.set_mode("monitor")
+        self._voice_session.set_barge_enabled(False)
+        self._tts.enqueue(spoken)
+
+    def _on_voice_error(self, message: str) -> None:
+        if self._closing:
+            return
+        self._chat.append_system(f"语音辅导: {message}")
+        if self._voice_active:
+            self._stop_voice_session()
+
+    def _on_speech_started(self) -> None:
+        if self._voice_active and self._voice_phase == "listening":
+            self._chat.set_voice_status("正在说")
+
+    def _on_tts_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        self._chat.append_system(f"TTS 失败: {message}")
+
+    def _on_tts_idle(self) -> None:
+        # The model may still be flushing the next sentence onto the queue.
+        QTimer.singleShot(200, self._maybe_resume_listen)
+
+    def _maybe_resume_listen(self) -> None:
+        if not self._voice_active or self._voice_phase != "speaking":
             return
         if self._llm_worker is not None and self._llm_worker.isRunning():
+            return
+        if self._tts.is_busy():
+            return
+        self._enter_listening()
+
+    def _on_barge_in(self) -> None:
+        if not self._voice_active:
+            return
+        self._voice_phase = "listening"
+        self._chat.set_voice_status("正在说")
+        self._chat.end_assistant_stream()
+        self._cancel_inflight()
+
+    def _on_capture_rejected(self) -> None:
+        if not self._voice_active or self._voice_phase == "recognizing":
+            return
+        self._enter_listening()
+
+    def _on_utterance(self, audio: object) -> None:
+        if not self._voice_active:
+            return
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if samples.size == 0:
+            return
+        self._turn += 1
+        turn = self._turn
+        self._sentence_buf.clear()
+        self._tts.stop()
+        self._voice_phase = "recognizing"
+        self._chat.set_voice_status("识别中")
+        self._voice_session.set_mode("paused")
+        self._asr_worker = ASRWorker(self._asr, samples, self._voice_session.sample_rate, turn)
+        _keep_alive(self._asr_worker)
+        self._asr_worker.succeeded.connect(self._on_asr_finished)
+        self._asr_worker.failed.connect(self._on_asr_failed)
+        self._asr_worker.start()
+
+    @Slot(int, str)
+    def _on_asr_finished(self, turn: int, text: str) -> None:
+        if turn != self._turn or not self._voice_active:
+            return
+        text = text.strip()
+        if not text:
+            self._enter_listening()
+            self._chat.set_voice_status("没听清，请再说")
+            return
+        self._chat.append_user(text)
+        if self._llm is None:
+            self._chat.append_system("助手仍在连接，请稍候")
+            self._enter_listening()
+            return
+        self._start_llm(text, voice_mode=True, stream=True)
+
+    @Slot(int, str)
+    def _on_asr_failed(self, turn: int, message: str) -> None:
+        if turn != self._turn:
+            return
+        self._chat.append_system(f"ASR 失败: {message}")
+        if self._voice_active:
+            self._enter_listening()
+
+    def _on_chat(self, text: str, voice_mode: bool = False) -> None:
+        if self._voice_active:
+            self._cancel_inflight()
+            self._chat.end_assistant_stream()
+            voice_mode = True
+        if self._llm is None:
+            self._chat.append_system("助手仍在连接，请稍候")
+            if self._voice_active:
+                self._enter_listening()
+            return
+        if not self._voice_active and self._llm_worker is not None and self._llm_worker.isRunning():
             self._chat.append_system("助手仍在回复上一问，请稍候")
             return
+        self._start_llm(text, voice_mode=voice_mode, stream=self._voice_active)
+
+    def _start_llm(self, text: str, voice_mode: bool, stream: bool) -> None:
         self._agent_ctx.selected_port = self._selected_port()
         self._pending_user_text = text
         self._pending_voice_mode = voice_mode
+        self._turn += 1
+        turn = self._turn
+        self._sentence_buf.clear()
+        self._voice_streamed = False
+        if self._voice_active:
+            self._voice_phase = "thinking"
+            self._chat.set_voice_status("老师在想")
+            self._voice_session.set_mode("monitor")
+            self._voice_session.set_barge_enabled(True)
         extra = self._extra_system_for_chat(voice_mode)
         self._llm_worker = LLMWorker(
-            self._llm,
+            self._llm,  # type: ignore[arg-type]
             text,
             self._tools,
             self._handlers,
-            self._dialog_history,
+            list(self._dialog_history),
             extra,
             voice_mode,
+            turn,
+            stream,
         )
-        self._llm_worker.finished.connect(self._on_llm_reply)
-        self._llm_worker.failed.connect(lambda e: self._chat.append_assistant(f"错误: {e}"))
-        self._chat.append_system("思考中…")
+        _keep_alive(self._llm_worker)
+        self._llm_worker.delta.connect(self._on_llm_delta)
+        self._llm_worker.revoke.connect(self._on_llm_revoke)
+        self._llm_worker.succeeded.connect(self._on_llm_reply)
+        self._llm_worker.failed.connect(self._on_llm_failed)
+        if not self._voice_active:
+            self._chat.append_system("思考中…")
         self._llm_worker.start()
 
-    @Slot(str)
-    def _on_llm_reply(self, reply: str) -> None:
-        self._chat.append_assistant(reply)
+    @Slot(int, str)
+    def _on_llm_delta(self, turn: int, text: str) -> None:
+        if turn != self._turn:
+            return
+        for sentence in self._sentence_buf.push(text):
+            self._emit_spoken_sentence(sentence)
+
+    def _emit_spoken_sentence(self, sentence: str) -> None:
+        self._voice_streamed = True
+        self._chat.append_assistant_chunk(sentence)
+        if not self._pending_voice_mode:
+            return
+        spoken = prepare_speech_text(sentence)
+        if not spoken:
+            return
+        if self._voice_active and self._voice_phase != "speaking":
+            self._voice_phase = "speaking"
+            self._chat.set_voice_status("讲解中")
+            self._voice_session.set_barge_enabled(False)
+            self._voice_session.refresh_barge_grace()
+        self._tts.enqueue(spoken)
+
+    @Slot(int)
+    def _on_llm_revoke(self, turn: int) -> None:
+        if turn != self._turn:
+            return
+        self._tts.stop()
+        self._sentence_buf.clear()
+        self._voice_streamed = False
+        self._chat.discard_assistant_stream()
+        if self._voice_active:
+            self._voice_phase = "thinking"
+            self._chat.set_voice_status("老师在想")
+            self._voice_session.set_mode("monitor")
+            self._voice_session.set_barge_enabled(True)
+
+    def _remember_turn(self, reply: str) -> None:
         self._dialog_history.append({"role": "user", "content": self._pending_user_text})
         self._dialog_history.append({"role": "assistant", "content": reply})
         if len(self._dialog_history) > 20:
             self._dialog_history = self._dialog_history[-20:]
-        if self._should_speak_reply(self._pending_voice_mode):
-            spoken = spoken_text_from_reply(reply, self._pending_voice_mode)
-            if spoken:
-                self._tts.speak(
-                    spoken,
-                    on_error=lambda e: self._chat.append_system(f"TTS 失败: {e}"),
-                )
-            elif self._pending_voice_mode:
-                self._chat.append_system("TTS：回复为空或无法朗读，请查看文字回复")
+
+    def _apply_overlay_update(self) -> None:
         if self._agent_ctx.overlay_hint:
             self._camera.set_overlay_hint(self._agent_ctx.overlay_hint)
 
+    @Slot(int, str)
+    def _on_llm_reply(self, turn: int, reply: str) -> None:
+        if turn != self._turn:
+            return
+        if self._pending_voice_mode and self._voice_active:
+            rest = self._sentence_buf.flush()
+            if rest:
+                self._emit_spoken_sentence(rest)
+            if reply.strip() and not self._voice_streamed:
+                self._emit_spoken_sentence(reply.strip())
+            self._chat.end_assistant_stream()
+            if reply.strip():
+                self._remember_turn(reply.strip())
+            self._apply_overlay_update()
+            if self._tts.is_busy():
+                self._voice_phase = "speaking"
+                self._chat.set_voice_status("讲解中")
+                self._voice_session.set_barge_enabled(False)
+            else:
+                self._enter_listening()
+            return
+
+        self._chat.append_assistant(reply)
+        self._remember_turn(reply)
+        if self._should_speak_reply(self._pending_voice_mode):
+            spoken = spoken_text_from_reply(reply, self._pending_voice_mode)
+            if spoken:
+                self._tts.speak(spoken)
+            elif self._pending_voice_mode:
+                self._chat.append_system("TTS：回复为空或无法朗读，请查看文字回复")
+        self._apply_overlay_update()
+
+    @Slot(int, str)
+    def _on_llm_failed(self, turn: int, message: str) -> None:
+        if turn != self._turn:
+            return
+        self._chat.end_assistant_stream()
+        self._chat.append_assistant(f"错误: {message}")
+        if self._voice_active:
+            self._enter_listening()
+
     def closeEvent(self, event) -> None:  # noqa: N802
         self._closing = True
+        self._voice_active = False
+        self._voice_phase = "idle"
+        self._turn += 1
+        if hasattr(self, "_voice_session"):
+            self._voice_session.stop()
         self._tts.stop()
         self._camera.stop()
         self._camera.wait(2000)
-        for worker in (self._board_worker, self._llm_connect_worker):
+        for worker in (
+            self._board_worker,
+            self._llm_connect_worker,
+            self._llm_worker,
+            self._asr_worker,
+        ):
             if worker is not None and worker.isRunning():
                 worker.requestInterruption()
         super().closeEvent(event)

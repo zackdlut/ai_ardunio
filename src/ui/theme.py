@@ -183,6 +183,11 @@ def app_stylesheet() -> str:
         color: {COLOR_TEXT};
     }}
 
+    QLabel#voiceStatus {{
+        color: {COLOR_COPPER};
+        font-size: 12px;
+    }}
+
     QScrollBar:vertical {{
         background: {COLOR_SURFACE};
         width: 10px;
