@@ -27,6 +27,20 @@ ALIASES: dict[str, str] = {
 }
 
 
+DISPLAY_ZH: dict[str, str] = {
+    "ArduinoUNO": "Arduino UNO",
+    "Breadboard": "面包板",
+    "LED": "LED",
+    "Resistor": "电阻",
+    "JumperWire": "杜邦线",
+    "Button": "按键",
+}
+
+
+def display_name(type_name: str) -> str:
+    return DISPLAY_ZH.get(type_name, type_name)
+
+
 def normalize_class_name(name: str) -> str:
     key = name.strip().lower().replace(" ", "_").replace("-", "_")
     if key in ALIASES:

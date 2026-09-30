@@ -18,6 +18,7 @@ class GestureCommand(str, Enum):
 class GestureResult:
     command: GestureCommand
     label: str = ""
+    points: list[tuple[float, float]] | None = None
 
 
 class GestureHandler:
@@ -59,7 +60,8 @@ class GestureHandler:
 
         lm = result.multi_hand_landmarks[0].landmark
         cmd = self._classify(lm)
-        return GestureResult(command=cmd, label=cmd.value)
+        points = [(float(p.x), float(p.y)) for p in lm]
+        return GestureResult(command=cmd, label=cmd.value, points=points)
 
     def _classify(self, landmarks) -> GestureCommand:
         # Finger extended heuristic (tip above pip in image y)
@@ -76,6 +78,8 @@ class GestureHandler:
             return GestureCommand.NEXT
         if fingers_up == 0 and not thumb_up:
             return GestureCommand.PAUSE
-        if fingers_up >= 2 and extended[1] and extended[2]:
+        # V: index + middle only. An open palm must not retrigger a rescan.
+        index, middle, ring, pinky = extended
+        if index and middle and not ring and not pinky:
             return GestureCommand.RESCAN
         return GestureCommand.NONE

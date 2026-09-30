@@ -9,6 +9,19 @@ from arduino.compile_manager import compile_project
 from arduino.upload_manager import upload_firmware
 from config.settings import get_settings
 from project.state_machine import ProjectStateMachine
+from vision.component_db import normalize_class_name
+
+_COMPONENT_ALIASES = {
+    "电阻": "Resistor",
+    "面包板": "Breadboard",
+    "杜邦线": "JumperWire",
+    "跳线": "JumperWire",
+    "按键": "Button",
+    "按钮": "Button",
+    "开发板": "ArduinoUNO",
+    "arduino": "ArduinoUNO",
+    "uno": "ArduinoUNO",
+}
 
 
 @dataclass
@@ -68,6 +81,31 @@ def build_openai_tools() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "highlight_component",
+                "description": "在摄像头画面上高亮器件或引脚，并显示一句短提示",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "hint": {
+                            "type": "string",
+                            "description": "叠在画面上的短中文，12 字以内",
+                        },
+                        "component": {
+                            "type": "string",
+                            "description": "LED、Resistor、JumperWire、ArduinoUNO、Breadboard、Button 之一，可空",
+                        },
+                        "pin": {
+                            "type": "string",
+                            "description": "可选引脚，如 D13、GND、5V",
+                        },
+                    },
+                    "required": ["hint"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "explain_last_error",
                 "description": "解释最近一次编译/烧录日志",
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -91,6 +129,7 @@ def build_tool_handlers(ctx: AgentContext) -> dict[str, Callable[..., str]]:
             "hint": step.hint,
             "requires": step.requires,
             "pin": step.pin,
+            "step_label": "下一步",
         }
         return json.dumps(
             {
@@ -123,6 +162,22 @@ def build_tool_handlers(ctx: AgentContext) -> dict[str, Callable[..., str]]:
             return f"烧录失败:\n{log[-4000:]}"
         return "编译与烧录成功"
 
+    def highlight_component(hint: str, component: str = "", pin: str = "") -> str:
+        progress = ctx.state_machine.progress()
+        component = (component or "").strip()
+        pin_name = (pin or "").strip()
+        if component:
+            component = _COMPONENT_ALIASES.get(component.lower(), component)
+            component = normalize_class_name(component)
+        requires = [component] if component else []
+        ctx.overlay_hint = {
+            "hint": (hint or "").strip(),
+            "requires": requires,
+            "pin": pin_name or None,
+            "step_label": f"第 {progress['step_index'] + 1}/{progress['total_steps']} 步",
+        }
+        return "已在画面标出：" + (hint or "").strip()
+
     def explain_last_error() -> str:
         if not ctx.last_build_log:
             return "暂无编译/烧录日志"
@@ -133,5 +188,6 @@ def build_tool_handlers(ctx: AgentContext) -> dict[str, Callable[..., str]]:
         "get_project_progress": lambda **_: get_project_progress(),
         "get_next_instruction": lambda **_: get_next_instruction(),
         "compile_and_upload": lambda **kw: compile_and_upload(**kw),
+        "highlight_component": lambda **kw: highlight_component(**kw),
         "explain_last_error": lambda **_: explain_last_error(),
     }

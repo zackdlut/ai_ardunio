@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from agent.tools import AgentContext, build_openai_tools, build_tool_handlers
+from vision.marks import nearest_component
 from agent.tutor_context import build_extra_system
 from arduino.board_manager import list_boards
 from config.settings import get_settings
@@ -218,10 +219,13 @@ class MainWindow(QMainWindow):
         self._scene: dict = {"nodes": {}, "summary": {}}
         self._verify_ok = True
         self._verify_msg = ""
+        self._user_marks: list[dict] = []
+        self._mark_seq = 0
+        self._vision_paused = False
         self._agent_ctx = AgentContext(
             state_machine=self._state_machine,
             get_scene=lambda: self._scene,
-            get_detections_json=lambda: [],
+            get_detections_json=self._detections_json,
         )
         self._tools = build_openai_tools()
         self._handlers = build_tool_handlers(self._agent_ctx)
@@ -246,6 +250,7 @@ class MainWindow(QMainWindow):
         self._answer_shown = False
 
         self._build_ui()
+        self._camera_widget.marked.connect(self._on_camera_mark)
         self._seed_camera_menu()
         self._update_step_label()
         self._chat.append_system(self._asr_mode_label())
@@ -350,12 +355,12 @@ class MainWindow(QMainWindow):
         self._step_title = QLabel()
         self._step_title.setObjectName("stepTitle")
         self._step_title.setWordWrap(True)
-        advance_btn = QPushButton("下一步")
-        advance_btn.setObjectName("primaryButton")
-        advance_btn.setToolTip("手动进入下一教学步骤")
-        advance_btn.clicked.connect(self._advance_step)
+        self._advance_btn = QPushButton("下一步")
+        self._advance_btn.setObjectName("primaryButton")
+        self._advance_btn.setToolTip("手动进入下一教学步骤")
+        self._advance_btn.clicked.connect(self._advance_step)
         title_row.addWidget(self._step_title, stretch=1)
-        title_row.addWidget(advance_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        title_row.addWidget(self._advance_btn, alignment=Qt.AlignmentFlag.AlignTop)
         side.addLayout(title_row)
 
         self._step_hint = QLabel()
@@ -462,6 +467,13 @@ class MainWindow(QMainWindow):
         self._show_log_action.setChecked(False)
         self._show_log_action.setToolTip("显示或隐藏编译与烧录日志")
         self._show_log_action.toggled.connect(self._set_log_visible)
+        self._pause_action = view.addAction(icon_stop(), "暂停识别")
+        self._pause_action.setCheckable(True)
+        self._pause_action.setToolTip("暂停器件识别，画面继续显示。竖起拇指可继续。")
+        self._pause_action.toggled.connect(self._set_vision_paused)
+        self._clear_marks_action = view.addAction(icon_clear(), "清除画面标记")
+        self._clear_marks_action.setToolTip("去掉你在画面上点出的标记")
+        self._clear_marks_action.triggered.connect(self._clear_marks)
         self._view_menu = view
 
         self._hardware_menu = ThemedMenu(self)
@@ -486,6 +498,12 @@ class MainWindow(QMainWindow):
         self._camera_group = QActionGroup(self)
         self._camera_group.setExclusive(True)
         self._camera_group.triggered.connect(self._on_camera_changed)
+        self._camera_insert_before = self._camera_menu.addSeparator()
+        pause_cam = self._camera_menu.addAction(icon_stop(), "暂停 / 继续识别")
+        pause_cam.setToolTip("暂停后画面还在，竖起拇指也会继续")
+        pause_cam.triggered.connect(lambda: self._set_vision_paused(not self._vision_paused))
+        clear_cam = self._camera_menu.addAction(icon_clear(), "清除画面标记")
+        clear_cam.triggered.connect(self._clear_marks)
 
         voice = ThemedMenu(self)
         voice.setObjectName("appMenu")
@@ -547,28 +565,103 @@ class MainWindow(QMainWindow):
             voice_mode,
         )
 
+    def _detections_json(self) -> list[dict]:
+        return [
+            {
+                "type": node.get("type"),
+                "bbox": node.get("bbox"),
+                "confidence": node.get("confidence"),
+            }
+            for node in (self._scene.get("nodes") or {}).values()
+        ]
+
     @Slot(dict)
     def _on_scene(self, scene: dict) -> None:
+        scene = dict(scene)
+        scene["user_marks"] = [dict(mark) for mark in self._user_marks]
         self._scene = scene
         ok, msg = self._state_machine.verify_step(scene)
         self._verify_ok = ok
         self._verify_msg = msg
         self._step_hint.setToolTip(msg)
+        hint = dict(self._agent_ctx.overlay_hint)
+        if ok:
+            hint.pop("status", None)
+            hint.pop("status_text", None)
+        else:
+            hint["status"] = "missing"
+            hint["status_text"] = msg
+        self._agent_ctx.overlay_hint = hint
+        self._camera.set_overlay_hint(hint)
 
     def _on_gesture(self, cmd: str) -> None:
+        if cmd == "pause":
+            self._set_vision_paused(True)
+            return
         if cmd == "next":
+            if self._vision_paused:
+                self._set_vision_paused(False)
+                return
             self._advance_step()
-        elif cmd == "pause":
-            self._camera.set_paused(True)
-            self._chat.append_system("手势：已暂停视觉处理")
-        elif cmd == "rescan":
-            self._camera.set_paused(False)
+            return
+        if cmd == "rescan":
+            if self._vision_paused:
+                self._set_vision_paused(False)
             self._camera.request_rescan()
             self._chat.append_system("手势：重新识别")
 
+    def _set_vision_paused(self, paused: bool) -> None:
+        if paused == self._vision_paused:
+            return
+        self._vision_paused = paused
+        self._camera.set_paused(paused)
+        if self._pause_action.isChecked() != paused:
+            self._pause_action.blockSignals(True)
+            self._pause_action.setChecked(paused)
+            self._pause_action.blockSignals(False)
+        if paused:
+            self._chat.append_system("识别已暂停。竖起拇指，或在「视图」里再点一次即可继续。")
+        else:
+            self._chat.append_system("已继续识别画面")
+
+    def _on_camera_mark(self, nx: float, ny: float) -> None:
+        for mark in self._user_marks:
+            if abs(float(mark["nx"]) - nx) < 0.03 and abs(float(mark["ny"]) - ny) < 0.03:
+                return
+        if len(self._user_marks) >= 6:
+            self._user_marks.pop(0)
+        self._mark_seq += 1
+        label = f"标记 {self._mark_seq}"
+        self._user_marks.append({"nx": round(nx, 3), "ny": round(ny, 3), "label": label})
+        self._push_marks()
+        near = nearest_component(self._scene, nx, ny)
+        if near:
+            self._chat.append_system(f"已添加{label}，靠近{near}。可以直接问「{label}这里该怎么接」。")
+        else:
+            self._chat.append_system(f"已添加{label}。可以直接问「{label}这里该怎么接」。")
+
+    def _push_marks(self) -> None:
+        self._camera.set_user_marks(self._user_marks)
+        scene = dict(self._scene)
+        scene["user_marks"] = [dict(mark) for mark in self._user_marks]
+        self._scene = scene
+
+    def _clear_marks(self) -> None:
+        if not self._user_marks:
+            return
+        self._user_marks.clear()
+        self._push_marks()
+        self._chat.append_system("已清除画面标记")
+
     def _apply_overlay_from_step(self) -> None:
         step = self._state_machine.current_step
-        hint = {"hint": step.hint, "requires": step.requires, "pin": step.pin}
+        progress = self._state_machine.progress()
+        hint = {
+            "hint": step.hint,
+            "requires": list(step.requires),
+            "pin": step.pin,
+            "step_label": f"第 {progress['step_index'] + 1}/{progress['total_steps']} 步",
+        }
         self._agent_ctx.overlay_hint = hint
         self._camera.set_overlay_hint(hint)
 
@@ -577,15 +670,18 @@ class MainWindow(QMainWindow):
         self._step_title.setText(
             f"{p['title']} · 第 {p['step_index'] + 1} / {p['total_steps']} 步"
         )
-        self._step_hint.setText(f"{p['current_step']}\n{p['current_hint']}")
+        self._step_hint.setText(p["current_hint"])
         total = max(p["total_steps"], 1)
         self._step_progress.setMaximum(total)
         self._step_progress.setValue(min(p["step_index"] + 1, total))
+        at_end = p["step_index"] + 1 >= p["total_steps"]
+        self._advance_btn.setEnabled(not at_end)
+        self._advance_btn.setText("已完成" if at_end else "下一步")
 
     def _announce_current_step(self) -> None:
         p = self._state_machine.progress()
         hint = p["current_hint"]
-        self._chat.append_system(f"进入步骤：{p['current_step']} — {hint}")
+        self._chat.append_system(f"现在这一步：{hint}")
         if self._voice_active:
             self._cancel_inflight()
             self._speak_in_session(hint)
@@ -597,6 +693,8 @@ class MainWindow(QMainWindow):
             self._apply_overlay_from_step()
             self._update_step_label()
             self._announce_current_step()
+            return
+        self._chat.append_system("已经是最后一步")
 
     def _on_camera_status(self, msg: str) -> None:
         if self._closing:
@@ -642,14 +740,14 @@ class MainWindow(QMainWindow):
             if data in (None, ""):
                 placeholder = QAction(icon_camera(), label, self)
                 placeholder.setEnabled(False)
-                self._camera_menu.addAction(placeholder)
+                self._camera_menu.insertAction(self._camera_insert_before, placeholder)
                 self._camera_placeholders.append(placeholder)
                 continue
             action = QAction(icon_camera(), label, self)
             action.setCheckable(True)
             action.setData(data)
             self._camera_group.addAction(action)
-            self._camera_menu.addAction(action)
+            self._camera_menu.insertAction(self._camera_insert_before, action)
             if pick is not None and data == pick:
                 chosen = action
         if chosen is None and self._camera_group.actions():

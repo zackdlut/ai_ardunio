@@ -16,14 +16,14 @@
       "id": "connect_d13",
       "requires": ["JumperWire"],
       "spatial": "near_uno_d13",
-      "hint": "Connect to D13",
+      "hint": "用杜邦线接到 UNO 的 D13",
       "pin": "D13"
     },
     {
       "id": "connect_gnd",
       "requires": ["JumperWire"],
       "spatial": "near_uno_gnd",
-      "hint": "Connect to GND",
+      "hint": "用杜邦线接到 UNO 的 GND",
       "pin": "GND"
     },
     {

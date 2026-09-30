@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 import cv2
 import numpy as np
 from PySide6.QtCore import QMutex, QThread, Signal
 
+from gesture.debounce import GestureDebouncer
 from gesture.mediapipe_ctrl import GestureCommand, GestureHandler
 from overlay.engine import OverlayEngine
-from vision.detector import YOLODetector
+from ui.camera_devices import _capture_backend
+from vision.detector import YOLODetector, scale_detection_boxes
 from vision.scene_parser import SceneGraphBuilder
 from vision.tracker import SimpleTracker
-from ui.camera_devices import _capture_backend
+
+_INFER_MAX_WIDTH = 640
+_FRAME_PERIOD = 1.0 / 30.0
 
 
 class CameraWorker(QThread):
@@ -29,18 +34,33 @@ class CameraWorker(QThread):
         self._camera_index = camera_index
         self._reopen_camera = False
         self._overlay_hint: dict[str, Any] = {}
+        self._user_marks: list[dict[str, Any]] = []
         self._force_rescan = False
         self._models_ready = False
+        self._infer_busy = False
+        self._infer_frame: np.ndarray | None = None
+        self._last_detections: list = []
+        self._infer_event = threading.Event()
+        self._last_infer_error = ""
 
         self._detector = YOLODetector()
         self._tracker = SimpleTracker()
         self._scene_builder = SceneGraphBuilder()
         self._overlay = OverlayEngine()
         self._gesture = GestureHandler()
+        self._gesture_debounce = GestureDebouncer()
+        self._last_gesture_at = 0.0
+        self._hand_points: list[tuple[float, float]] | None = None
+        self._hand_seen_at = 0.0
 
     def set_overlay_hint(self, hint: dict[str, Any]) -> None:
         self._mutex.lock()
         self._overlay_hint = hint or {}
+        self._mutex.unlock()
+
+    def set_user_marks(self, marks: list[dict[str, Any]]) -> None:
+        self._mutex.lock()
+        self._user_marks = [dict(item) for item in marks]
         self._mutex.unlock()
 
     def set_paused(self, paused: bool) -> None:
@@ -62,9 +82,14 @@ class CameraWorker(QThread):
 
     def stop(self) -> None:
         self._running = False
+        self._infer_event.set()
 
     def _open_capture(self, index: int) -> cv2.VideoCapture:
         cap = cv2.VideoCapture(index, _capture_backend())
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         return cap
 
     def _load_models(self) -> None:
@@ -93,37 +118,122 @@ class CameraWorker(QThread):
         else:
             self.status_message.emit("检测模型未能加载")
 
-    def run(self) -> None:
-        cap = self._open_capture(self._camera_index)
-        if not cap.isOpened():
-            self.status_message.emit(f"无法打开摄像头 index={self._camera_index}")
+    def _submit_infer(self, frame: np.ndarray) -> None:
+        self._mutex.lock()
+        if not self._models_ready or self._infer_busy:
+            self._mutex.unlock()
             return
+        self._infer_busy = True
+        self._infer_frame = frame.copy()
+        self._mutex.unlock()
+        self._infer_event.set()
 
-        loader = threading.Thread(target=self._load_models, name="vision-load", daemon=True)
-        loader.start()
+    def _detect_fast(self, frame: np.ndarray):
+        height, width = frame.shape[:2]
+        if width <= _INFER_MAX_WIDTH:
+            return self._detector.detect(frame)
+        scale = _INFER_MAX_WIDTH / width
+        small_h = max(1, int(round(height * scale)))
+        small = cv2.resize(frame, (_INFER_MAX_WIDTH, small_h), interpolation=cv2.INTER_LINEAR)
+        dets = self._detector.detect(small)
+        scale_detection_boxes(dets, width / _INFER_MAX_WIDTH, height / small_h)
+        return dets
 
-        frame_idx = 0
-        last_scene: dict = {"nodes": {}, "summary": {}}
-        last_detections = []
+    def _gesture_frame(self, frame: np.ndarray) -> np.ndarray:
+        height, width = frame.shape[:2]
+        if width <= _INFER_MAX_WIDTH:
+            return frame
+        scale = _INFER_MAX_WIDTH / width
+        return cv2.resize(
+            frame,
+            (_INFER_MAX_WIDTH, max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_LINEAR,
+        )
 
+    def _read_gesture(self, frame: np.ndarray) -> None:
+        now = time.monotonic()
+        if now - self._last_gesture_at < 0.12:
+            return
+        self._last_gesture_at = now
+        result = self._gesture.process(self._gesture_frame(frame))
+        now = time.monotonic()
+        self._mutex.lock()
+        if result.points:
+            self._hand_points = result.points
+            self._hand_seen_at = now
+        elif now - self._hand_seen_at > 0.4:
+            self._hand_points = None
+        self._mutex.unlock()
+        fired = self._gesture_debounce.push(result.command)
+        if fired is not None and fired != GestureCommand.NONE:
+            self.gesture_detected.emit(fired.value)
+
+    def _report_infer_error(self, exc: Exception) -> None:
+        text = f"识别暂时失败: {exc}"
+        if text == self._last_infer_error:
+            return
+        self._last_infer_error = text
+        self.status_message.emit(text)
+
+    def _infer_loop(self) -> None:
+        self._load_models()
+        while self._running:
+            if not self._infer_event.wait(0.3):
+                continue
+            self._infer_event.clear()
+            self._mutex.lock()
+            frame = self._infer_frame
+            self._infer_frame = None
+            paused = self._paused
+            force = self._force_rescan
+            if force:
+                self._force_rescan = False
+            self._mutex.unlock()
+            try:
+                if frame is None:
+                    continue
+                self._read_gesture(frame)
+                if paused and not force:
+                    continue
+                dets = self._detect_fast(frame)
+                tracked = self._tracker.update(dets)
+                scene = self._scene_builder.build(tracked)
+                scene["frame"] = {
+                    "width": int(frame.shape[1]),
+                    "height": int(frame.shape[0]),
+                }
+                self._mutex.lock()
+                self._last_detections = tracked
+                self._mutex.unlock()
+                self._last_infer_error = ""
+                self.scene_updated.emit(scene)
+            except Exception as exc:  # noqa: BLE001
+                self._report_infer_error(exc)
+            finally:
+                self._mutex.lock()
+                self._infer_busy = False
+                self._mutex.unlock()
+
+    def _capture_loop(self, cap: cv2.VideoCapture) -> None:
+        next_tick = time.perf_counter()
         while self._running:
             self._mutex.lock()
-            if self._reopen_camera:
+            reopen = self._reopen_camera
+            if reopen:
                 new_index = self._camera_index
                 self._reopen_camera = False
-                self._mutex.unlock()
+            self._mutex.unlock()
+            if reopen:
                 cap.release()
                 cap = self._open_capture(new_index)
                 if not cap.isOpened():
                     self.status_message.emit(f"无法打开摄像头 index={new_index}")
                     self.msleep(500)
                     continue
-                frame_idx = 0
-                last_scene = {"nodes": {}, "summary": {}}
-                last_detections = []
-                self.status_message.emit(f"已切换到摄像头 {new_index}")
-            else:
+                self._mutex.lock()
+                self._last_detections = []
                 self._mutex.unlock()
+                self.status_message.emit(f"已切换到摄像头 {new_index}")
 
             ok, frame = cap.read()
             if not ok:
@@ -132,38 +242,46 @@ class CameraWorker(QThread):
 
             self._mutex.lock()
             paused = self._paused
+            ready = self._models_ready
+            detections = list(self._last_detections)
             hint = dict(self._overlay_hint)
-            force = self._force_rescan
-            models_ready = self._models_ready
-            if force and models_ready and not paused:
-                self._force_rescan = False
+            marks = [dict(item) for item in self._user_marks]
+            hand = list(self._hand_points) if self._hand_points else None
             self._mutex.unlock()
+            if ready:
+                self._submit_infer(frame)
 
-            if not paused and models_ready:
-                if frame_idx % 2 == 0 or force:
-                    dets = self._detector.detect(frame)
-                    last_detections = self._tracker.update(dets)
-                    last_scene = self._scene_builder.build(last_detections)
-                    self.scene_updated.emit(last_scene)
+            shown = self._overlay.render(
+                frame,
+                detections,
+                hint=hint,
+                marks=marks,
+                paused=paused,
+                pulse=time.monotonic(),
+                hand=hand,
+            )
+            self.frame_ready.emit(shown)
 
-                g = self._gesture.process(frame)
-                if g.command != GestureCommand.NONE:
-                    self.gesture_detected.emit(g.command.value)
+            next_tick += _FRAME_PERIOD
+            delay = next_tick - time.perf_counter()
+            if delay > 0:
+                self.msleep(max(1, int(delay * 1000)))
+            else:
+                next_tick = time.perf_counter()
 
-            out = frame
-            if last_detections:
-                out = self._overlay.show_bbox(out, last_detections)
-            if hint:
-                out = self._overlay.render_step_guide(
-                    out,
-                    last_detections,
-                    hint.get("hint", ""),
-                    target_types=hint.get("requires"),
-                    pin=hint.get("pin"),
-                )
+    def run(self) -> None:
+        cv2.setNumThreads(2)
+        cap = self._open_capture(self._camera_index)
+        if not cap.isOpened():
+            self.status_message.emit(f"无法打开摄像头 index={self._camera_index}")
+            return
 
-            self.frame_ready.emit(out)
-            frame_idx += 1
-            self.msleep(15)
-
-        cap.release()
+        infer = threading.Thread(target=self._infer_loop, name="vision-infer", daemon=True)
+        infer.start()
+        try:
+            self._capture_loop(cap)
+        finally:
+            self._running = False
+            self._infer_event.set()
+            infer.join(timeout=2.0)
+            cap.release()

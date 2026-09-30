@@ -20,6 +20,13 @@ def build_extra_system(
         f"视觉摘要(counts): {json.dumps(summary, ensure_ascii=False)}",
         f"步骤校验: {'通过' if verify_ok else '未通过'} — {verify_msg}",
     ]
+    marks = scene_summary.get("user_marks") or []
+    if marks:
+        parts.append(
+            "学生在画面上的标记（nx/ny 为相对宽高 0 到 1）: "
+            + json.dumps(marks, ensure_ascii=False)
+        )
+        parts.append("学生若问起「这里」或某个标记，就按这些坐标和最近的器件回答。")
     if voice_mode:
         parts.append(
             "学生正在用语音和你面对面交流。请只输出要说出口的话："

@@ -128,3 +128,17 @@ class YOLODetector:
                     )
                 )
         return detections
+
+
+def scale_detection_boxes(detections: List[Detection], scale_x: float, scale_y: float) -> None:
+    """Map boxes from a resized inference frame back to the camera frame."""
+    if scale_x == 1 and scale_y == 1:
+        return
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox
+        det.bbox = [
+            int(round(x1 * scale_x)),
+            int(round(y1 * scale_y)),
+            int(round(x2 * scale_x)),
+            int(round(y2 * scale_y)),
+        ]

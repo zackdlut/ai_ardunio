@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from project.models import StepHistory, get_session_factory
+from vision.component_db import display_name
 
 
 @dataclass
@@ -72,13 +73,13 @@ class ProjectStateMachine:
     def verify_step(self, scene_summary: dict[str, Any]) -> tuple[bool, str]:
         step = self.current_step
         if step.action == "upload_sketch":
-            return True, "准备烧录（请确认接线后执行 upload）"
+            return True, "可以编译烧录了，先确认接线"
 
         counts = scene_summary.get("summary", {})
-        missing = [r for r in step.requires if counts.get(r, 0) < 1]
+        missing = [display_name(r) for r in step.requires if counts.get(r, 0) < 1]
         if missing:
-            return False, f"未检测到: {', '.join(missing)}（置信度可能较低，可语音确认）"
-        return True, "步骤条件已满足（启发式判断）"
+            return False, f"还没看到：{'、'.join(missing)}"
+        return True, "这一步需要的器件已经出现在画面里"
 
     def progress(self) -> dict[str, Any]:
         completed = [s.id for s in self.project.steps[: self._index]]
