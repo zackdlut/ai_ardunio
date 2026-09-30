@@ -23,7 +23,7 @@ pip install -r requirements.txt
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-可选：将自训 YOLO 权重放到 `models/best.pt`。未放置时使用 `yolov8n.pt`（COCO）占位，仅用于跑通管线。
+可选：将自训 YOLO 权重放到 `models/best.pt`。未放置时使用 `yolov8n.pt`（COCO）占位，仅用于跑通管线。`YOLO_DEVICE=auto`（默认）时，若本机有 Intel NPU，检测会经 OpenVINO 跑在 NPU 上；没有 NPU 或编译失败时仍用 CPU。
 
 ## 运行
 

@@ -97,8 +97,8 @@ class CameraWorker(QThread):
             return
         self.status_message.emit("正在加载检测模型…")
         try:
-            self._detector.load()
-            if self._running and self._detector.enabled:
+            self._detector.load(status=self.status_message.emit)
+            if self._running and self._detector.enabled and self._detector.runtime_label != "Intel NPU":
                 dummy = np.zeros((480, 640, 3), dtype=np.uint8)
                 self._detector.detect(dummy)
             if self._running:
@@ -111,10 +111,13 @@ class CameraWorker(QThread):
         self._mutex.lock()
         self._models_ready = True
         self._mutex.unlock()
-        if self._detector.load_error:
-            self.status_message.emit(self._detector.load_error)
         if self._detector.enabled:
-            self.status_message.emit("检测模型已就绪")
+            ready = f"检测模型已就绪（{self._detector.runtime_label}）"
+            if self._detector.load_error:
+                ready = f"{ready}。{self._detector.load_error}"
+            self.status_message.emit(ready)
+        elif self._detector.load_error:
+            self.status_message.emit(f"检测模型未能加载：{self._detector.load_error}")
         else:
             self.status_message.emit("检测模型未能加载")
 

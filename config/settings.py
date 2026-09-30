@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AsrBackend = Literal["local", "remote"]
 TtsBackend = Literal["local"]
+YoloDevice = Literal["auto", "cpu", "npu"]
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -53,14 +54,15 @@ class Settings(BaseSettings):
     yolo_model_path: Path = Field(
         default=ROOT_DIR / "models" / "best.pt", alias="YOLO_MODEL_PATH"
     )
+    yolo_device: YoloDevice = Field(default="auto", alias="YOLO_DEVICE")
     database_path: Path = Field(
         default=ROOT_DIR / "data" / "copilot.db", alias="DATABASE_PATH"
     )
     projects_dir: Path = Field(default=ROOT_DIR / "config" / "projects")
 
-    @field_validator("asr_backend", mode="before")
+    @field_validator("asr_backend", "yolo_device", mode="before")
     @classmethod
-    def _normalize_asr_backend(cls, value: object) -> str:
+    def _normalize_choice(cls, value: object) -> str:
         if isinstance(value, str):
             return value.strip().lower()
         return value
