@@ -10,5 +10,8 @@ build/
 .mypy_cache/
 models/*.pt
 !models/.gitkeep
+yolo*.pt
+dataset/
+runs/
 data/*.db
 *.log
