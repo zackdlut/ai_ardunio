@@ -6,10 +6,13 @@ from typing import Any, Callable
 from sqlalchemy import or_, select
 
 from project.models import get_session_factory
-from repair.models import RepairCase, RepairCheck, RepairDocument
+from repair.models import RepairCase, RepairCheck, RepairDocument, RepairGuide
 
 CHECK_STATUSES = ("pending", "pass", "fail", "skip")
 CHECK_KINDS = ("check", "fault", "ok", "danger")
+STEP_STATUSES = ("pending", "done", "failed", "skipped")
+GUIDE_STATUSES = ("active", "done", "cancelled")
+STEP_FIELDS = ("title", "instruction", "verify", "shapes", "status", "feedback")
 
 
 def _loads_list(text: str) -> list:
@@ -33,6 +36,33 @@ def _check_dict(row: RepairCheck) -> dict[str, Any]:
         "status": row.status,
         "measured": row.measured,
         "note": row.note,
+    }
+
+
+def _clean_step(step: dict[str, Any]) -> dict[str, Any]:
+    status = str(step.get("status") or "pending")
+    return {
+        "title": str(step.get("title") or "").strip()[:80],
+        "instruction": str(step.get("instruction") or "").strip(),
+        "verify": str(step.get("verify") or "").strip(),
+        "shapes": [dict(s) for s in step.get("shapes") or [] if isinstance(s, dict)],
+        "status": status if status in STEP_STATUSES else "pending",
+        "feedback": str(step.get("feedback") or "").strip(),
+    }
+
+
+def _guide_dict(row: RepairGuide) -> dict[str, Any]:
+    box = _loads_list(row.board_box)
+    return {
+        "id": row.id,
+        "case_id": row.case_id,
+        "check_id": row.check_id,
+        "title": row.title,
+        "steps": [_clean_step(s) for s in _loads_list(row.steps) if isinstance(s, dict)],
+        "current_step": row.current_step,
+        "status": row.status,
+        "board_box": box if len(box) == 4 else None,
+        "summary": row.summary,
     }
 
 
@@ -209,6 +239,102 @@ class CaseManager:
             row.safety_notes = safety_notes.strip()
             db.commit()
             return self._case_dict(db, row)
+
+    # -- step-by-step guides ---------------------------------------------------
+
+    def start_guide(
+        self,
+        case_id: int,
+        title: str,
+        steps: list[dict[str, Any]],
+        check_id: int | None = None,
+        board_box: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """Start a guide; an active guide of the same case is cancelled."""
+        cleaned = [_clean_step(s) for s in steps if isinstance(s, dict)]
+        cleaned = [s for s in cleaned if s["title"] or s["instruction"]]
+        if not cleaned:
+            raise ValueError("指引至少要有一步")
+        with self._factory() as db:
+            self._require_case(db, case_id)
+            for old in db.scalars(
+                select(RepairGuide).where(
+                    RepairGuide.case_id == case_id, RepairGuide.status == "active"
+                )
+            ):
+                old.status = "cancelled"
+            row = RepairGuide(
+                case_id=case_id,
+                check_id=int(check_id) if check_id not in (None, "") else None,
+                title=title.strip()[:200] or cleaned[0]["title"],
+                steps=json.dumps(cleaned, ensure_ascii=False),
+                current_step=0,
+                status="active",
+                board_box=json.dumps(board_box) if board_box else "",
+            )
+            db.add(row)
+            db.commit()
+            return _guide_dict(row)
+
+    def active_guide(self, case_id: int) -> dict[str, Any] | None:
+        with self._factory() as db:
+            row = db.scalars(
+                select(RepairGuide)
+                .where(RepairGuide.case_id == case_id, RepairGuide.status == "active")
+                .order_by(RepairGuide.id.desc())
+                .limit(1)
+            ).first()
+            return _guide_dict(row) if row else None
+
+    def get_guide(self, guide_id: int) -> dict[str, Any] | None:
+        with self._factory() as db:
+            row = db.get(RepairGuide, int(guide_id))
+            return _guide_dict(row) if row else None
+
+    def set_step(self, guide_id: int, index: int) -> dict[str, Any]:
+        with self._factory() as db:
+            row = self._require_guide(db, guide_id)
+            count = len(_loads_list(row.steps))
+            row.current_step = min(max(int(index), 0), max(0, count - 1))
+            db.commit()
+            return _guide_dict(row)
+
+    def update_step(self, guide_id: int, index: int, **fields: Any) -> dict[str, Any]:
+        with self._factory() as db:
+            row = self._require_guide(db, guide_id)
+            steps = _loads_list(row.steps)
+            if not 0 <= int(index) < len(steps):
+                raise ValueError(f"步骤不存在: 第 {int(index) + 1} 步")
+            step = dict(steps[int(index)])
+            step.update({k: v for k, v in fields.items() if k in STEP_FIELDS and v is not None})
+            steps[int(index)] = _clean_step(step)
+            row.steps = json.dumps(steps, ensure_ascii=False)
+            db.commit()
+            return _guide_dict(row)
+
+    def save_steps(self, guide_id: int, steps: list[dict[str, Any]]) -> dict[str, Any]:
+        with self._factory() as db:
+            row = self._require_guide(db, guide_id)
+            row.steps = json.dumps([_clean_step(s) for s in steps], ensure_ascii=False)
+            db.commit()
+            return _guide_dict(row)
+
+    def end_guide(self, guide_id: int, status: str = "done", summary: str = "") -> dict[str, Any]:
+        with self._factory() as db:
+            row = self._require_guide(db, guide_id)
+            row.status = status if status in GUIDE_STATUSES else "done"
+            if summary.strip():
+                row.summary = summary.strip()
+            db.commit()
+            return _guide_dict(row)
+
+    def _require_guide(self, db, guide_id: int) -> RepairGuide:
+        row = db.get(RepairGuide, int(guide_id))
+        if row is None:
+            raise ValueError(f"指引不存在: {guide_id}")
+        return row
+
+    # -- documents --------------------------------------------------------------
 
     def add_document(
         self,

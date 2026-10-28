@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QModelIndex, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -21,22 +21,54 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QVBoxLayout,
     QWidget,
 )
 
-from ui.chrome import ThemedMenu
+from ui.chrome import RailCard, ThemedMenu
 from ui.icons import bind_editor_menu, icon_clear
-from ui.theme import COLOR_ACCENT_INK, COLOR_TEXT, COLOR_TEXT_MUTED
+from ui.theme import (
+    COLOR_ACCENT,
+    COLOR_ACCENT_INK,
+    COLOR_ACCENT_SOFT,
+    COLOR_CAUTION,
+    COLOR_FAULT,
+    COLOR_TEXT,
+    COLOR_TEXT_MUTED,
+    COLOR_TRACK_EMPTY,
+    FONT_MONO_FAMILIES,
+)
 
 STATUS_TEXT = {"pending": "待查", "pass": "正常", "fail": "异常", "skip": "跳过"}
 _STATUS_COLOR = {
-    "pending": COLOR_TEXT,
+    "pending": COLOR_TEXT_MUTED,
     "pass": COLOR_ACCENT_INK,
-    "fail": "#B3261E",
-    "skip": COLOR_TEXT_MUTED,
+    "fail": COLOR_FAULT,
+    "skip": COLOR_CAUTION,
 }
-_PANEL_MAX_HEIGHT = 360
+_STEP_COLOR = {
+    "pending": COLOR_TRACK_EMPTY,
+    "done": "#8ACFAF",
+    "failed": COLOR_FAULT,
+    "skipped": COLOR_CAUTION,
+}
+_STEP_WORD = {"pending": "待做", "done": "已完成", "failed": "未通过", "skipped": "已跳过"}
+_TRACK_CHIP = {
+    "tracking": ("跟踪中", COLOR_ACCENT_INK),
+    "weak": ("跟踪弱", COLOR_CAUTION),
+    "lost": ("跟丢了", COLOR_FAULT),
+    "frozen": ("已定格", COLOR_CAUTION),
+    "off": ("跟踪关", COLOR_TEXT_MUTED),
+    "idle": ("未锚定", COLOR_TEXT_MUTED),
+}
+_ROLE_STATUS = Qt.ItemDataRole.UserRole + 1
+_ROLE_SEQ = Qt.ItemDataRole.UserRole + 2
+_ROLE_MEASURED = Qt.ItemDataRole.UserRole + 3
+_ROW_HEIGHT = 26
+_PANEL_MAX_HEIGHT = 470
 _DOC_FILTER = "资料 (*.pdf *.png *.jpg *.jpeg *.bmp *.webp);;PDF (*.pdf);;图片 (*.png *.jpg *.jpeg *.bmp *.webp)"
 
 
@@ -71,6 +103,132 @@ class NewCaseDialog(QDialog):
         return self._device.text().strip(), self._symptom.toPlainText().strip()
 
 
+def _mono(size: int, bold: bool = False) -> QFont:
+    font = QFont()
+    font.setFamilies(FONT_MONO_FAMILIES)
+    font.setPixelSize(size)
+    font.setBold(bold)
+    return font
+
+
+class _StepTrack(QWidget):
+    """One segment per guide step, colored by its state; the current one stands taller."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._states: list[str] = []
+        self._current = 0
+        self.setFixedHeight(10)
+
+    def set_steps(self, states: list[str], current: int) -> None:
+        self._states = list(states)
+        self._current = current
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        count = len(self._states)
+        if not count:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        gap = 4.0
+        width = (self.width() - gap * (count - 1)) / count
+        for i, state in enumerate(self._states):
+            current = i == self._current
+            height = 6.0 if current else 4.0
+            color = QColor(_STEP_COLOR.get(state, COLOR_TRACK_EMPTY))
+            if current and state == "pending":
+                color = QColor(COLOR_ACCENT)
+            painter.setBrush(color)
+            rect = QRectF(i * (width + gap), (self.height() - height) / 2, width, height)
+            painter.drawRoundedRect(rect, height / 2, height / 2)
+        painter.end()
+
+
+class _CheckDelegate(QStyledItemDelegate):
+    """Checklist row: status mark, mono sequence number, title, and the reading on the right."""
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        return QSize(40, _ROW_HEIGHT)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        status = index.data(_ROLE_STATUS)
+        if status is None:
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(option.rect).adjusted(1, 1, -1, -1)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if selected:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLOR_ACCENT_SOFT))
+            painter.drawRoundedRect(rect, 6, 6)
+        color = QColor(_STATUS_COLOR.get(status, COLOR_TEXT_MUTED))
+        center = QPointF(rect.left() + 12, rect.center().y())
+        self._mark(painter, center, status, color, selected)
+
+        x = rect.left() + 24
+        painter.setFont(_mono(11))
+        painter.setPen(QColor(COLOR_TEXT_MUTED))
+        seq = f"{int(index.data(_ROLE_SEQ) or 0):02d}"
+        painter.drawText(QRectF(x, rect.top(), 22, rect.height()), int(Qt.AlignmentFlag.AlignVCenter), seq)
+        x += 24
+
+        measured = str(index.data(_ROLE_MEASURED) or "")
+        right = rect.right() - 6
+        if measured:
+            font = _mono(12, bold=True)
+            painter.setFont(font)
+            width = min(painter.fontMetrics().horizontalAdvance(measured) + 4, int(rect.width() * 0.35))
+            painter.setPen(color)
+            box = QRectF(right - width, rect.top(), width, rect.height())
+            text = painter.fontMetrics().elidedText(measured, Qt.TextElideMode.ElideRight, int(width))
+            painter.drawText(box, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), text)
+            right -= width + 10
+
+        font = QFont(option.font)
+        font.setPixelSize(12)
+        font.setBold(selected)
+        font.setStrikeOut(status == "skip")
+        painter.setFont(font)
+        painter.setPen(QColor(COLOR_TEXT_MUTED if status == "skip" else COLOR_TEXT))
+        title = painter.fontMetrics().elidedText(
+            str(index.data(Qt.ItemDataRole.DisplayRole) or ""), Qt.TextElideMode.ElideRight, int(right - x)
+        )
+        painter.drawText(QRectF(x, rect.top(), right - x, rect.height()), int(Qt.AlignmentFlag.AlignVCenter), title)
+        painter.restore()
+
+    @staticmethod
+    def _mark(painter: QPainter, c: QPointF, status: str, color: QColor, current: bool) -> None:
+        r = 6.0
+        if status == "pending":
+            painter.setPen(QPen(QColor(COLOR_ACCENT if current else COLOR_TEXT_MUTED), 1.6 if current else 1.2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(c, r, r)
+            if current:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(COLOR_ACCENT))
+                painter.drawEllipse(c, 2.6, 2.6)
+            return
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(c, r, r)
+        pen = QPen(QColor("#FFFFFF"), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        if status == "pass":
+            painter.drawPolyline(
+                QPolygonF([c + QPointF(-2.8, 0.2), c + QPointF(-0.8, 2.3), c + QPointF(3.0, -2.2)])
+            )
+        elif status == "fail":
+            painter.drawLine(c + QPointF(-2.3, -2.3), c + QPointF(2.3, 2.3))
+            painter.drawLine(c + QPointF(2.3, -2.3), c + QPointF(-2.3, 2.3))
+        else:
+            painter.drawLine(c + QPointF(-2.8, 0), c + QPointF(2.8, 0))
+
+
 class RepairPanel(QWidget):
     new_case_requested = Signal(str, str)
     result_reported = Signal(int, str, str)
@@ -80,10 +238,18 @@ class RepairPanel(QWidget):
     ifixit_requested = Signal()
     freeze_toggled = Signal(bool)
     clear_annotations_requested = Signal()
+    realign_requested = Signal()
+    guide_prev = Signal()
+    guide_next = Signal()
+    guide_verify = Signal()
+    guide_end = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._case: dict[str, Any] | None = None
+        self._guide: dict[str, Any] | None = None
+        self._guide_index = 0
+        self._verifying = False
         self._syncing = False
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -97,13 +263,21 @@ class RepairPanel(QWidget):
         outer.addWidget(scroll)
         body = QWidget()
         scroll.setWidget(body)
+        self._scroll, self._body = scroll, body
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 6, 0)
         layout.setSpacing(6)
 
+        head = QHBoxLayout()
+        head.setSpacing(6)
         eyebrow = QLabel("维修单")
         eyebrow.setObjectName("sectionEyebrow")
-        layout.addWidget(eyebrow)
+        self._case_no = QLabel("")
+        self._case_no.setObjectName("readoutMuted")
+        head.addWidget(eyebrow)
+        head.addWidget(self._case_no)
+        head.addStretch(1)
+        layout.addLayout(head)
 
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
@@ -133,10 +307,84 @@ class RepairPanel(QWidget):
         clear_btn = QPushButton("清除标注")
         clear_btn.setObjectName("voiceButton")
         clear_btn.clicked.connect(self.clear_annotations_requested.emit)
+        realign = QPushButton("重新对准")
+        realign.setObjectName("voiceButton")
+        realign.setToolTip("跟丢后把板子摆回原位，或以当前画面为准重新锚定图形")
+        realign.clicked.connect(self.realign_requested.emit)
+        self._track_chip = QLabel("")
+        self._track_chip.setObjectName("trackChip")
+        self._track_chip.setTextFormat(Qt.TextFormat.RichText)
+        self._track_chip.setToolTip("图形是否贴住板子：跟踪中 / 跟踪弱 / 跟丢了 / 已定格")
         tools.addWidget(self._freeze)
         tools.addWidget(clear_btn)
+        tools.addWidget(realign)
         tools.addStretch(1)
+        tools.addWidget(self._track_chip, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(tools)
+        self.set_tracking("idle")
+
+        self._guide_card = RailCard(rail=COLOR_ACCENT)
+        self._guide_card.setObjectName("guideCard")
+        card = QVBoxLayout(self._guide_card)
+        card.setContentsMargins(14, 9, 12, 10)
+        card.setSpacing(6)
+        guide_head = QHBoxLayout()
+        guide_head.setSpacing(6)
+        guide_eyebrow = QLabel("操作指引")
+        guide_eyebrow.setObjectName("sectionEyebrow")
+        self._guide_name = QLabel("")
+        self._guide_name.setObjectName("stepHint")
+        self._guide_progress = QLabel("")
+        self._guide_progress.setObjectName("readout")
+        guide_head.addWidget(guide_eyebrow)
+        guide_head.addWidget(self._guide_name, stretch=1)
+        guide_head.addWidget(self._guide_progress)
+        card.addLayout(guide_head)
+        self._guide_track = _StepTrack()
+        card.addWidget(self._guide_track)
+        self._guide_title = QLabel("")
+        self._guide_title.setObjectName("guideStepTitle")
+        self._guide_title.setWordWrap(True)
+        card.addWidget(self._guide_title)
+        self._guide_text = QLabel("")
+        self._guide_text.setObjectName("guideInstruction")
+        self._guide_text.setWordWrap(True)
+        self._guide_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        card.addWidget(self._guide_text)
+        self._guide_verify = QLabel("")
+        self._guide_verify.setObjectName("guideVerify")
+        self._guide_verify.setWordWrap(True)
+        self._guide_verify.setTextFormat(Qt.TextFormat.RichText)
+        self._guide_verify.setToolTip("点「做好了」后，助手看画面按这条判断")
+        card.addWidget(self._guide_verify)
+        self._guide_feedback = QLabel("")
+        self._guide_feedback.setObjectName("guideFeedback")
+        self._guide_feedback.setWordWrap(True)
+        self._guide_feedback.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        card.addWidget(self._guide_feedback)
+        guide_buttons = QHBoxLayout()
+        guide_buttons.setSpacing(6)
+        self._prev_btn = QPushButton("上一步")
+        self._prev_btn.setObjectName("voiceButton")
+        self._prev_btn.clicked.connect(self.guide_prev.emit)
+        self._next_btn = QPushButton("跳过")
+        self._next_btn.setObjectName("voiceButton")
+        self._next_btn.setToolTip("不经确认直接进入下一步，这一步记为跳过")
+        self._next_btn.clicked.connect(self.guide_next.emit)
+        self._verify_btn = QPushButton("做好了，帮我确认")
+        self._verify_btn.setObjectName("primaryButton")
+        self._verify_btn.setToolTip("把当前画面发给助手，判断这一步是否完成（也可以竖起大拇指）")
+        self._verify_btn.clicked.connect(self.guide_verify.emit)
+        end_btn = QPushButton("结束")
+        end_btn.setObjectName("voiceButton")
+        end_btn.clicked.connect(self.guide_end.emit)
+        guide_buttons.addWidget(self._prev_btn)
+        guide_buttons.addWidget(self._next_btn)
+        guide_buttons.addWidget(self._verify_btn, stretch=1)
+        guide_buttons.addWidget(end_btn)
+        card.addLayout(guide_buttons)
+        self._guide_card.hide()
+        layout.addWidget(self._guide_card)
 
         checks_head = QHBoxLayout()
         checks_eyebrow = QLabel("检查清单")
@@ -150,6 +398,8 @@ class RepairPanel(QWidget):
 
         self._checks = QListWidget()
         self._checks.setObjectName("checkList")
+        self._checks.setItemDelegate(_CheckDelegate(self._checks))
+        self._checks.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._checks.currentItemChanged.connect(self._on_check_selected)
         layout.addWidget(self._checks)
 
@@ -224,18 +474,73 @@ class RepairPanel(QWidget):
         self._freeze.setText("取消定格" if frozen else "定格画面")
         self._freeze.blockSignals(False)
 
+    def set_tracking(self, status: str) -> None:
+        text, color = _TRACK_CHIP.get(status, _TRACK_CHIP["idle"])
+        self._track_chip.setText(f'<span style="color:{color}">●</span>&nbsp;{text}')
+        self._track_chip.setStyleSheet(f"color: {color};")
+
+    def set_verifying(self, busy: bool) -> None:
+        self._verifying = busy
+        self._verify_btn.setEnabled(not busy)
+        self._verify_btn.setText("正在看画面…" if busy else "做好了，帮我确认")
+        self._sync_guide_buttons()
+
+    def show_guide(self, guide: dict[str, Any] | None) -> None:
+        self._guide = guide
+        steps = (guide or {}).get("steps") or []
+        if not guide or guide.get("status") != "active" or not steps:
+            self._guide_card.hide()
+            self._fit_height()
+            return
+        index = min(max(int(guide.get("current_step") or 0), 0), len(steps) - 1)
+        step = steps[index]
+        state = step.get("status") or "pending"
+        self._guide_index = index
+        self._guide_name.setText(guide.get("title") or "")
+        self._guide_progress.setText(f"{index + 1:02d} / {len(steps):02d}")
+        self._guide_track.set_steps([s.get("status") or "pending" for s in steps], index)
+        self._guide_track.setToolTip(
+            "\n".join(
+                f"{i + 1}. {s.get('title') or ''}  {_STEP_WORD.get(s.get('status') or 'pending', '')}"
+                for i, s in enumerate(steps)
+            )
+        )
+        self._guide_title.setText(step.get("title") or "")
+        self._guide_text.setText(step.get("instruction") or "")
+        self._guide_text.setVisible(bool(step.get("instruction")))
+        verify = step.get("verify") or ""
+        self._guide_verify.setText(
+            f'<span style="color:{COLOR_TEXT_MUTED}; font-weight:600">确认标准</span>&nbsp;&nbsp;{_esc(verify)}'
+        )
+        self._guide_verify.setVisible(bool(verify))
+        feedback = step.get("feedback") or ""
+        failed = state == "failed"
+        self._guide_feedback.setProperty("tone", "fail" if failed else "ok")
+        self._guide_feedback.style().unpolish(self._guide_feedback)
+        self._guide_feedback.style().polish(self._guide_feedback)
+        self._guide_feedback.setText(("还没好：" if failed else "助手：") + feedback)
+        self._guide_feedback.setVisible(bool(feedback))
+        self._guide_card.set_tone(COLOR_FAULT if failed else COLOR_ACCENT)
+        self._next_btn.setText("跳过并结束" if index == len(steps) - 1 else "跳过")
+        self._sync_guide_buttons()
+        self._guide_card.show()
+        self._fit_height()
+
     def show_case(self, case: dict[str, Any] | None) -> None:
         self._case = case
         if not case:
+            self._case_no.setText("")
             self._title.setText("还没有维修单")
             self._symptom.setText("点「新建」写下设备和现象，或者直接在下面对话里描述")
             self._fill_checks([], None)
             self._conclusion.hide()
-            return
-        self._title.setText(f"#{case['id']} · {case.get('device') or '设备未填写'}")
-        self._symptom.setText(case.get("symptom") or "故障现象未填写")
-        self._fill_checks(case.get("checks") or [], case.get("current_check_id"))
-        self._show_conclusion(case)
+        else:
+            self._case_no.setText(f"#{case['id']:03d}")
+            self._title.setText(case.get("device") or "设备未填写")
+            self._symptom.setText(case.get("symptom") or "故障现象未填写")
+            self._fill_checks(case.get("checks") or [], case.get("current_check_id"))
+            self._show_conclusion(case)
+        self._fit_height()
 
     def show_documents(self, docs: list[dict[str, Any]]) -> None:
         self._docs.clear()
@@ -252,6 +557,7 @@ class RepairPanel(QWidget):
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
             self._docs.addItem(empty)
         _fit_rows(self._docs, max_rows=3)
+        self._fit_height()
 
     def selected_check(self) -> dict[str, Any] | None:
         item = self._checks.currentItem()
@@ -274,13 +580,12 @@ class RepairPanel(QWidget):
             status = check.get("status") or "pending"
             if status != "pending":
                 done += 1
-            text = f"{check['seq']}. {check['title']}  [{STATUS_TEXT.get(status, status)}]"
-            if check.get("measured"):
-                text += f"  {check['measured']}"
-            item = QListWidgetItem(text)
+            item = QListWidgetItem(check["title"])
             item.setData(Qt.ItemDataRole.UserRole, check["id"])
-            item.setForeground(QColor(_STATUS_COLOR.get(status, COLOR_TEXT)))
-            tip = [check.get("instruction") or ""]
+            item.setData(_ROLE_STATUS, status)
+            item.setData(_ROLE_SEQ, check["seq"])
+            item.setData(_ROLE_MEASURED, check.get("measured") or "")
+            tip = [f"{check['seq']}. {check['title']}  [{STATUS_TEXT.get(status, status)}]", check.get("instruction") or ""]
             if check.get("expected"):
                 tip.append(f"预期：{check['expected']}")
             item.setToolTip("\n".join(t for t in tip if t))
@@ -327,6 +632,15 @@ class RepairPanel(QWidget):
         if self._syncing or current is None or check is None:
             return
         self.check_focused.emit(int(check["id"]))
+
+    def _fit_height(self) -> None:
+        """Grow to the content up to the cap; QScrollArea's own hint stops short of it."""
+        self._body.layout().activate()
+        self._scroll.setMinimumHeight(min(self._body.sizeHint().height() + 2, _PANEL_MAX_HEIGHT))
+
+    def _sync_guide_buttons(self) -> None:
+        self._prev_btn.setEnabled(self._guide_index > 0 and not self._verifying)
+        self._next_btn.setEnabled(not self._verifying)
 
     def _sync_report_enabled(self) -> None:
         enabled = self.selected_check() is not None

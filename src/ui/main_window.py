@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from agent.frame_image import encode_frame_data_url
+from agent.frame_image import encode_frame_data_url, fit_frame
 from agent.prompts import REPAIR_SYSTEM_PROMPT
 from agent.repair_context import build_repair_extra_system
 from agent.repair_tools import RepairContext, build_repair_handlers, build_repair_tools
@@ -34,7 +34,9 @@ from config.settings import get_settings
 from project.repository import create_session
 from project.state_machine import ProjectStateMachine, load_project
 from repair.annotations import sent_image_size
+from overlay.engine import OverlayEngine
 from repair.case_manager import CaseManager
+from repair.debug_log import RepairDebugLog
 from repair.documents import DocumentLibrary
 from repair.ifixit import IFixitClient
 from ui.camera_devices import list_cameras
@@ -296,10 +298,17 @@ class MainWindow(QMainWindow):
             ifixit=self._make_ifixit(settings),
             box_format=settings.repair_box_format,
             on_change=self._repair_bridge.changed.emit,
+            debug=self._make_repair_debug(settings),
         )
+        self._repair_clean_view = False
+        self._marks_overlay = OverlayEngine()
         latest = self._repair.cases.latest_open_case()
         if latest:
             self._repair.case_id = latest["id"]
+            self._repair.load_guide()
+        self._guide_seen = self._snapshot_guide(self._repair.guide)
+        self._track_status = "idle"
+        self._lost_notified = False
         self._repair_tools = build_repair_tools(settings.ifixit_enabled)
         self._repair_handlers = build_repair_handlers(self._repair)
         self._ingest_worker: DocIngestWorker | None = None
@@ -336,6 +345,11 @@ class MainWindow(QMainWindow):
         panel.ifixit_requested.connect(self._on_repair_ifixit)
         panel.freeze_toggled.connect(self._on_repair_freeze)
         panel.clear_annotations_requested.connect(lambda: self._repair.set_annotations([]))
+        panel.realign_requested.connect(self._on_repair_realign)
+        panel.guide_prev.connect(self._repair.back)
+        panel.guide_next.connect(self._on_guide_next)
+        panel.guide_verify.connect(self._verify_guide_step)
+        panel.guide_end.connect(self._on_guide_end)
         panel.set_ifixit_enabled(settings.ifixit_enabled)
         self._seed_camera_menu()
         self._update_step_label()
@@ -346,6 +360,12 @@ class MainWindow(QMainWindow):
         self._camera.scene_updated.connect(self._on_scene)
         self._camera.gesture_detected.connect(self._on_gesture)
         self._camera.status_message.connect(self._on_camera_status)
+        self._camera.tracking_changed.connect(self._on_tracking_changed)
+        self._camera.configure_tracking(
+            settings.repair_tracking,
+            settings.repair_track_features,
+            settings.repair_track_min_inliers,
+        )
         self._camera.start()
 
         self._voice_session = VoiceSession(self._settings, self)
@@ -694,6 +714,10 @@ class MainWindow(QMainWindow):
                 box_format=self._repair.box_format,
                 frozen=self._repair_panel_frozen(),
                 ifixit_enabled=self._repair.ifixit is not None,
+                guide=self._repair.guide,
+                track_status=self._track_status,
+                image_size=self._repair.image_size,
+                clean_image=self._repair_clean_view,
             )
         return build_extra_system(
             self._state_machine.progress(),
@@ -709,7 +733,29 @@ class MainWindow(QMainWindow):
             return None
         if self._llm.supports_vision is False:
             return None
+        if self._mode == "repair":
+            return self._repair_anchor_frame()
         return self._camera_widget.latest_frame()
+
+    def _repair_anchor_frame(self) -> np.ndarray | None:
+        """The frame for the model, made the new tracking reference.
+
+        Shapes are carried into its coordinates first, so whatever the model
+        reads or draws lines up with the picture it gets. The model sees the
+        clean camera frame with only the user's marks: our own boxes and labels
+        on the picture made it box the overlay or the wrong part.
+        """
+        self._repair_clean_view = False
+        snap = self._camera.anchor_snapshot()
+        if snap is None:
+            self._repair.anchor_frame = None
+            return self._camera_widget.latest_frame()
+        raw, _shown, H = snap
+        self._repair.rebase(H)
+        self._repair.anchor_frame = raw
+        self._refresh_repair_overlay()
+        self._repair_clean_view = True
+        return self._marks_overlay.render_marks(raw, self._user_marks)
 
     def _detections_json(self) -> list[dict]:
         return [
@@ -749,6 +795,9 @@ class MainWindow(QMainWindow):
         if cmd == "next":
             if self._vision_paused:
                 self._set_vision_paused(False)
+                return
+            if self._mode == "repair" and self._repair.current_step() is not None:
+                self._verify_guide_step()
                 return
             self._advance_step()
             return
@@ -870,7 +919,10 @@ class MainWindow(QMainWindow):
 
     def _advance_step(self) -> None:
         if self._mode == "repair":
-            self._next_check()
+            if self._repair.current_step() is not None:
+                self._on_guide_next()
+            else:
+                self._next_check()
             return
         if self._state_machine.advance():
             self._apply_overlay_from_step()
@@ -1285,17 +1337,33 @@ class MainWindow(QMainWindow):
             self._voice_session.set_mode("monitor")
             self._voice_session.set_barge_enabled(True)
         frame = self._frame_for_chat()
-        extra = self._extra_system_for_chat(voice_mode, has_image=frame is not None)
         repair = self._mode == "repair"
         max_side = (
             self._settings.repair_frame_max_side if repair else self._settings.llm_frame_max_side
         )
         if repair:
             self._repair.drain_images()
-            self._repair.image_size = (
+            self._repair.begin_turn(
+                self._repair.anchor_frame if frame is not None else None,
                 sent_image_size(frame.shape[1], frame.shape[0], max_side)
                 if frame is not None
-                else None
+                else None,
+            )
+        extra = self._extra_system_for_chat(voice_mode, has_image=frame is not None)
+        if repair and self._repair.debug is not None:
+            self._repair.debug.begin(
+                turn,
+                text,
+                extra,
+                None if frame is None else fit_frame(frame, max_side),
+                self._repair.anchor_frame,
+                {
+                    "model": self._settings.openai_model,
+                    "box_format": self._repair.box_format,
+                    "track_status": self._track_status,
+                    "frozen": self._repair_frozen,
+                    "clean_image": self._repair_clean_view,
+                },
             )
         self._llm_worker = LLMWorker(
             self._llm,  # type: ignore[arg-type]
@@ -1388,6 +1456,8 @@ class MainWindow(QMainWindow):
     def _on_llm_reply(self, turn: int, reply: str) -> None:
         if turn != self._turn:
             return
+        self._repair_panel.set_verifying(False)
+        self._finish_repair_debug(turn, reply)
         if self._pending_voice_mode and self._voice_active:
             rest = self._sentence_buf.flush()
             if rest:
@@ -1434,6 +1504,8 @@ class MainWindow(QMainWindow):
     def _on_llm_failed(self, turn: int, message: str) -> None:
         if turn != self._turn:
             return
+        self._repair_panel.set_verifying(False)
+        self._finish_repair_debug(turn, f"错误: {message}")
         self._chat.end_assistant_stream()
         self._chat.append_assistant(f"错误: {message}")
         if self._voice_active:
@@ -1445,13 +1517,29 @@ class MainWindow(QMainWindow):
             return None
         return IFixitClient(settings.ifixit_base_url, settings.ifixit_timeout_s)
 
+    def _finish_repair_debug(self, turn: int, reply: str) -> None:
+        debug = self._repair.debug
+        if debug is None or self._mode != "repair":
+            return
+        folder = debug.finish(turn, reply, self._repair.current_shapes(), self._repair.anchor_frame)
+        if folder is not None:
+            self._chat.append_system(f"调试记录：{folder}")
+
+    @staticmethod
+    def _make_repair_debug(settings) -> RepairDebugLog | None:
+        return RepairDebugLog(settings.repair_debug_dir) if settings.repair_debug else None
+
     def _apply_repair_settings(self) -> None:
         cfg = self._settings
+        self._repair.debug = self._make_repair_debug(cfg)
         self._repair.box_format = cfg.repair_box_format
         self._repair.ifixit = self._make_ifixit(cfg)
         self._repair.library = DocumentLibrary(cfg.repair_docs_dir)
         self._repair_tools = build_repair_tools(cfg.ifixit_enabled)
         self._repair_panel.set_ifixit_enabled(cfg.ifixit_enabled)
+        self._camera.configure_tracking(
+            cfg.repair_tracking, cfg.repair_track_features, cfg.repair_track_min_inliers
+        )
 
     def _show_mode_page(self, index: int) -> None:
         self._mode_stack.setCurrentIndex(index)
@@ -1477,6 +1565,7 @@ class MainWindow(QMainWindow):
         self._push_marks()
         self._app_title.setText("维修助手" if repair else "学习助手")
         self._copilot_title.setText("维修顾问" if repair else "助教")
+        self._chat.set_assistant_name("维修顾问" if repair else "助教")
         self._chat.set_input_placeholder(
             "描述故障现象，或问「标记 1 是什么」…" if repair else "问问当前这一步…"
         )
@@ -1497,7 +1586,8 @@ class MainWindow(QMainWindow):
             self._repair_frozen = False
             self._camera.set_frozen(False)
             self._repair_panel.set_frozen(False)
-            self._camera.set_annotations([])
+            self._repair_panel.set_verifying(False)
+            self._camera.set_shapes([])
             self._apply_overlay_from_step()
             self._chat.append_system("已回到教学模式")
         if self._voice_active:
@@ -1508,9 +1598,24 @@ class MainWindow(QMainWindow):
 
     def _refresh_repair_panel(self) -> None:
         self._repair_panel.show_case(self._repair.case())
+        self._repair_panel.show_guide(self._repair.guide)
         self._repair_panel.show_documents(self._repair.documents())
 
     def _repair_hint(self, case: dict | None) -> dict:
+        current_step = self._repair.current_step()
+        if current_step is not None:
+            index, step = current_step
+            guide = self._repair.guide or {}
+            text = step.get("title") or ""
+            if step.get("status") == "failed" and step.get("feedback"):
+                text += f" · {step['feedback']}"
+            elif step.get("instruction"):
+                text += f" · {step['instruction']}"
+            return {
+                "hint": text[:80],
+                "step_label": f"步骤 {index + 1}/{len(guide.get('steps') or [])}",
+                "check_id": guide.get("check_id"),
+            }
         if not case:
             return {"step_label": "维修"}
         checks = case.get("checks") or []
@@ -1534,7 +1639,7 @@ class MainWindow(QMainWindow):
         if self._mode != "repair":
             return
         self._camera.set_overlay_hint(self._repair_hint(self._repair.case()))
-        self._camera.set_annotations(self._repair.annotations)
+        self._camera.set_shapes(self._repair.current_shapes(), self._repair.board_box)
 
     @Slot(str)
     def _on_repair_changed(self, what: str) -> None:
@@ -1547,22 +1652,161 @@ class MainWindow(QMainWindow):
             self._refresh_repair_panel()
         elif what == "conclusion":
             self._repair_panel.show_case(self._repair.case())
+        elif what == "guide":
+            self._repair_panel.show_guide(self._repair.guide)
+            self._announce_guide()
         self._refresh_repair_overlay()
+
+    @Slot(str)
+    def _on_tracking_changed(self, status: str) -> None:
+        self._track_status = status
+        self._repair_panel.set_tracking(status)
+        if self._mode != "repair":
+            return
+        if status == "tracking":
+            self._lost_notified = False
+        elif status == "lost" and not self._lost_notified and self._repair.current_shapes():
+            self._lost_notified = True
+            self._chat.append_system(
+                "画面跟丢了，图形先隐藏。把板子移回原来的位置会自动恢复；"
+                "换了角度的话点「重新对准」，或让我重新标注。"
+            )
+
+    def _on_repair_realign(self) -> None:
+        if self._repair_frozen:
+            self._repair_panel.set_frozen(False)
+            self._on_repair_freeze(False)
+        snap = self._camera.anchor_snapshot()
+        if snap is None:
+            self._chat.append_system("摄像头还没有画面")
+            return
+        self._repair.rebase(snap[2])
+        self._refresh_repair_overlay()
+        self._lost_notified = False
+        self._chat.append_system("已按当前画面重新锚定图形。位置对不上的话，让我重新标一下。")
+
+    def _on_guide_next(self) -> None:
+        current = self._repair.current_step()
+        if current is None:
+            return
+        index, step = current
+        guide = self._repair.advance(mark="skipped")
+        nxt = self._repair.current_step()
+        ended = guide is None or guide.get("status") != "active" or nxt is None
+        self._chat.append_event(
+            f"第 {index + 1} 步 · 已跳过",
+            step.get("title") or "",
+            "指引已结束" if ended else f"下一步：{nxt[1]['title']}",
+            tone="skip",
+        )
+
+    def _on_guide_end(self) -> None:
+        guide = self._repair.guide
+        if not guide:
+            return
+        steps = guide.get("steps") or []
+        done = sum(1 for s in steps if s.get("status") == "done")
+        self._repair.end_guide("用户手动结束", "cancelled" if done < len(steps) else "done")
+        self._chat.append_event(
+            "指引已结束", guide.get("title") or "", f"确认完成 {done} / {len(steps)} 步", tone="info"
+        )
+
+    def _snapshot_guide(self, guide: dict | None) -> dict | None:
+        if not guide or guide.get("status") != "active":
+            return None
+        return {
+            "id": guide["id"],
+            "title": guide.get("title") or "",
+            "steps": [(s.get("status"), s.get("feedback") or "") for s in guide.get("steps") or []],
+        }
+
+    def _announce_guide(self) -> None:
+        """Turn guide changes made by the assistant into cards: started, step confirmed, not yet, finished."""
+        guide = self._repair.guide
+        before, after = self._guide_seen, self._snapshot_guide(guide)
+        self._guide_seen = after
+        if after is not None and (before is None or before["id"] != after["id"]):
+            steps = guide.get("steps") or []
+            self._chat.append_event(
+                f"操作指引 · 共 {len(steps)} 步",
+                after["title"],
+                f"第 1 步：{steps[0].get('title') or ''}" if steps else "",
+                tone="info",
+            )
+            return
+        if before is None:
+            return
+        record = guide if after is not None else self._repair.cases.get_guide(before["id"])
+        if not record:
+            return
+        steps = record.get("steps") or []
+        for i, (old, new) in enumerate(zip(before["steps"], [(s.get("status"), s.get("feedback") or "") for s in steps])):
+            if old == new:
+                continue
+            title = steps[i].get("title") or ""
+            if new[0] == "done":
+                self._chat.append_event(
+                    f"第 {i + 1} 步 · 已确认", title, new[1] or "助手看了画面，这一步完成了", tone="pass", stamp="通过"
+                )
+            elif new[0] == "failed":
+                self._chat.append_event(
+                    f"第 {i + 1} 步 · 还没完成", title, new[1] or "按画面上的提示再试一次", tone="fail", stamp="未通过"
+                )
+        if after is None and record.get("status") == "done" and all(s.get("status") == "done" for s in steps):
+            self._chat.append_event(
+                "指引完成", record.get("title") or "", f"{len(steps)} 步全部确认通过", tone="pass", stamp="完成"
+            )
+
+    def _verify_guide_step(self) -> None:
+        current = self._repair.current_step()
+        if current is None:
+            return
+        if self._llm is None or (self._llm_busy() and not self._voice_active):
+            self._chat.append_system("助手正忙，等它说完再确认")
+            return
+        if not self._settings.llm_send_frame or self._llm.supports_vision is False:
+            self._chat.append_system("确认需要把画面发给助手：请在设置里开启发送画面，或点「下一步」手动继续")
+            return
+        if self._repair_frozen:
+            self._repair_panel.set_frozen(False)
+            self._on_repair_freeze(False, quiet=True)
+        index, step = current
+        text = f"我做完了第 {index + 1} 步「{step.get('title')}」。"
+        if step.get("verify"):
+            text += f"判断标准：{step['verify']}。"
+        text += "请看画面确认是否完成：完成就调用 confirm_step 进入下一步，没完成告诉我哪里不对。"
+        self._repair_panel.set_verifying(True)
+        verify = step.get("verify")
+        self._send_repair_message(
+            text,
+            event=(
+                f"请助手确认 · 第 {index + 1} 步",
+                step.get("title") or "",
+                f"确认标准：{verify}" if verify else "看画面判断这一步是否完成",
+                "ask",
+            ),
+        )
 
     def _llm_busy(self) -> bool:
         return self._llm_worker is not None and self._llm_worker.isRunning()
 
-    def _send_repair_message(self, text: str) -> None:
+    def _send_repair_message(self, text: str, event: tuple[str, str, str, str] | None = None) -> None:
+        """Send ``text`` to the assistant; ``event`` shows a card in its place instead of a user bubble."""
         if self._llm is None or (self._llm_busy() and not self._voice_active):
+            self._repair_panel.set_verifying(False)
             self._chat.append_system("已记录。助手空闲后可以接着问。")
             return
-        self._chat.append_user(text)
+        if event is None:
+            self._chat.append_user(text)
+        else:
+            eyebrow, title, detail, tone = event
+            self._chat.append_event(eyebrow, title, detail, tone=tone)
         self._on_chat(text)
 
     def _on_repair_new_case(self, device: str, symptom: str) -> None:
         case = self._repair.new_case(device, symptom)
         self._dialog_history.clear()
-        self._chat.append_system(f"已新建维修单 #{case['id']}")
+        event = (f"新建维修单 #{case['id']:03d}", device or "设备未填写", symptom, "info")
         parts = []
         if device:
             parts.append(f"设备：{device}")
@@ -1570,8 +1814,11 @@ class MainWindow(QMainWindow):
             parts.append(f"故障现象：{symptom}")
         if parts:
             self._send_repair_message(
-                "，".join(parts) + "。请先分析可能的原因，再列出检查清单，能在画面上看到的位置请标出来。"
+                "，".join(parts) + "。请先分析可能的原因，再列出检查清单，能在画面上看到的位置请标出来。",
+                event=event,
             )
+        else:
+            self._chat.append_event(*event[:3], tone="info")
 
     def _on_repair_result(self, check_id: int, status: str, measured: str) -> None:
         try:
@@ -1581,15 +1828,27 @@ class MainWindow(QMainWindow):
             return
         check = result["recorded"]
         nxt = result["next_check"]
-        text = f"检查 {check['seq']}「{check['title']}」结果：{STATUS_TEXT.get(status, status)}"
+        word = STATUS_TEXT.get(status, status)
+        text = f"检查 {check['seq']}「{check['title']}」结果：{word}"
         if measured:
             text += f"，实测 {measured}"
+        tone = {"pass": "pass", "fail": "fail", "skip": "skip"}.get(status, "info")
+        eyebrow = f"检查 {check['seq']:02d} · {word}"
+        reading = f"实测 {measured}" if measured else ""
         if status == "fail":
-            self._send_repair_message(text + "。请分析原因，告诉我下一步怎么查。")
+            detail = " · ".join(p for p in (reading, "已请助手分析下一步") if p)
+            self._send_repair_message(
+                text + "。请分析原因，告诉我下一步怎么查。", event=(eyebrow, check["title"], detail, tone)
+            )
         elif nxt is None:
-            self._send_repair_message(text + "。清单已经查完，请根据结果给出结论或新的检查项。")
+            detail = " · ".join(p for p in (reading, "清单查完了，已请助手给结论") if p)
+            self._send_repair_message(
+                text + "。清单已经查完，请根据结果给出结论或新的检查项。",
+                event=(eyebrow, check["title"], detail, tone),
+            )
         else:
-            self._chat.append_system(f"已记录。下一项：{nxt['seq']}. {nxt['title']}")
+            detail = " · ".join(p for p in (reading, f"下一项：{nxt['seq']}. {nxt['title']}") if p)
+            self._chat.append_event(eyebrow, check["title"], detail, tone=tone)
 
     def _on_repair_focus(self, check_id: int) -> None:
         try:
@@ -1639,13 +1898,18 @@ class MainWindow(QMainWindow):
         device = self._repair_panel.device or "这台设备"
         self._send_repair_message(f"请在 iFixit 上查一下{device}相关的拆机、维修指南和常见故障。")
 
-    def _on_repair_freeze(self, frozen: bool) -> None:
+    def _on_repair_freeze(self, frozen: bool, quiet: bool = False) -> None:
         self._repair_frozen = frozen
-        self._camera.set_frozen(frozen)
+        H = self._camera.set_frozen(frozen)
+        if frozen:
+            self._repair.rebase(H)
+            self._refresh_repair_overlay()
+        if quiet:
+            return
         self._chat.append_system(
-            "画面已定格，标注会固定在这张图上。测量完点「取消定格」回到实时画面。"
+            "画面已定格，图形固定在这张图上。测量完点「取消定格」回到实时画面。"
             if frozen
-            else "已回到实时画面。板子移动过的话，可以让我重新标注。"
+            else "已回到实时画面，图形会继续贴着板子移动。"
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802

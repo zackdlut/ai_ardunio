@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QPainter, QPainterPath, QPalette, QPen
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPalette, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -14,10 +14,31 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ui.chrome import RoundedCard, ThemedMenu
+from ui.chrome import RailCard, RoundedCard, ThemedMenu
 from ui.icons import bind_editor_menu, icon_copy
 from ui.markdown_render import code_blocks, render_markdown
-from ui.theme import COLOR_ACCENT, COLOR_BORDER, COLOR_SURFACE, COLOR_USER_BUBBLE
+from ui.theme import (
+    COLOR_ACCENT,
+    COLOR_ACCENT_INK,
+    COLOR_BORDER,
+    COLOR_CAUTION,
+    COLOR_CAUTION_SOFT,
+    COLOR_FAULT,
+    COLOR_FAULT_SOFT,
+    COLOR_SURFACE,
+    COLOR_TEXT_MUTED,
+    COLOR_USER_BUBBLE,
+)
+
+# tone -> (rail, fill, eyebrow ink)
+EVENT_TONES = {
+    "ask": (COLOR_ACCENT, COLOR_SURFACE, COLOR_ACCENT_INK),
+    "pass": (COLOR_ACCENT_INK, "#F2FAF6", COLOR_ACCENT_INK),
+    "fail": (COLOR_FAULT, COLOR_FAULT_SOFT, COLOR_FAULT),
+    "skip": (COLOR_CAUTION, COLOR_CAUTION_SOFT, COLOR_CAUTION),
+    "info": ("#B7C4BC", COLOR_SURFACE, COLOR_TEXT_MUTED),
+}
+_STAMP_SPACE = 76
 
 _Radii = tuple[float, float, float, float]
 
@@ -185,8 +206,91 @@ class _ThinkingNote(QWidget):
         self._toggle.setToolTip("展开思考")
 
 
+class _EventCard(RailCard):
+    """A logged bench action (asked to verify, check result, step skipped) with an optional stamp."""
+
+    def __init__(self, tone: str, stamp: str) -> None:
+        rail, fill, ink = EVENT_TONES.get(tone, EVENT_TONES["info"])
+        super().__init__(rail=rail, fill=fill, radius=10)
+        self._ink = QColor(ink)
+        self._stamp = stamp
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if not self._stamp:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = self.font()
+        font.setPixelSize(13)
+        font.setBold(True)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
+        painter.setFont(font)
+        width = painter.fontMetrics().horizontalAdvance(self._stamp) + 18
+        cx = self.width() - _STAMP_SPACE / 2 - 2
+        cy = min(self.height() / 2, 30)
+        painter.translate(cx, cy)
+        painter.rotate(-9)
+        box = QRectF(-width / 2, -13, width, 26)
+        ink = QColor(self._ink)
+        ink.setAlpha(215)
+        painter.setPen(QPen(ink, 1.8))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(box, 4, 4)
+        ink.setAlpha(110)
+        painter.setPen(QPen(ink, 0.9))
+        painter.drawRoundedRect(box.adjusted(2.5, 2.5, -2.5, -2.5), 2.5, 2.5)
+        ink.setAlpha(225)
+        painter.setPen(ink)
+        painter.drawText(box, int(Qt.AlignmentFlag.AlignCenter), self._stamp)
+        painter.end()
+
+
+class _EventRow(QWidget):
+    """Full-width log entry in the transcript; not a chat bubble, so nobody 'said' it."""
+
+    def __init__(self, eyebrow: str, title: str, detail: str, tone: str, stamp: str) -> None:
+        super().__init__()
+        self._text = "\n".join(t for t in (eyebrow, title, detail) if t)
+        self.setAutoFillBackground(False)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._open_menu)
+        card = _EventCard(tone, stamp)
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(14, 8, 12 + (_STAMP_SPACE if stamp else 0), 9)
+        inner.setSpacing(2)
+        ink = EVENT_TONES.get(tone, EVENT_TONES["info"])[2]
+        for name, value in (("eventEyebrow", eyebrow), ("eventTitle", title), ("eventDetail", detail)):
+            if not value:
+                continue
+            label = QLabel(value)
+            label.setObjectName(name)
+            label.setWordWrap(True)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            if name == "eventEyebrow":
+                label.setStyleSheet(f"color: {ink};")
+            inner.addWidget(label)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 2, 0, 2)
+        outer.addWidget(card)
+
+    def text(self) -> str:
+        return self._text
+
+    def set_max_width(self, width: int) -> None:
+        del width
+
+    def _open_menu(self, pos) -> None:
+        menu = ThemedMenu(self)
+        menu.addAction(icon_copy(), "复制").triggered.connect(
+            lambda: QGuiApplication.clipboard().setText(self._text)
+        )
+        menu.exec(self.mapToGlobal(pos))
+
+
 class _MessageRow(QWidget):
-    def __init__(self, role: str, text: str, extras) -> None:
+    def __init__(self, role: str, text: str, extras, assistant_name: str = "助教") -> None:
         super().__init__()
         self._role = role
         self._text = text
@@ -239,7 +343,7 @@ class _MessageRow(QWidget):
         self._bubble = bubble
         self._show(text)
 
-        role_label = QLabel("你" if role == "user" else "助教")
+        role_label = QLabel("你" if role == "user" else assistant_name)
         role_label.setObjectName("bubbleRole")
         column = QVBoxLayout()
         column.setContentsMargins(0, 0, 0, 0)
@@ -317,6 +421,7 @@ class ChatWidget(QWidget):
         self._thinking: _ThinkingNote | None = None
         self._notes: list[_ThinkingNote] = []
         self._context_actions: list[QAction] = []
+        self._assistant_name = "助教"
 
         self.setObjectName("chatSidebar")
         layout = QVBoxLayout(self)
@@ -437,7 +542,18 @@ class ChatWidget(QWidget):
         self._append_row("assistant", text)
 
     def append_system(self, text: str) -> None:
-        row = self._make_row("system", text)
+        self._place_before_stream(self._make_row("system", text))
+
+    def append_event(
+        self, eyebrow: str, title: str, detail: str = "", tone: str = "info", stamp: str = ""
+    ) -> None:
+        """A card for something that happened on the bench (tone: ask/pass/fail/skip/info)."""
+        self._place_before_stream(_EventRow(eyebrow, title, detail, tone, stamp))
+
+    def set_assistant_name(self, name: str) -> None:
+        self._assistant_name = name
+
+    def _place_before_stream(self, row) -> None:
         if self._stream_open and self._stream_row is not None:
             index = self._list.indexOf(self._stream_row)
             self._list.insertWidget(index, row)
@@ -528,7 +644,7 @@ class ChatWidget(QWidget):
         return row
 
     def _make_row(self, role: str, text: str) -> _MessageRow:
-        row = _MessageRow(role, text, self._context_actions_now)
+        row = _MessageRow(role, text, self._context_actions_now, self._assistant_name)
         row.set_max_width(self._bubble_width())
         return row
 

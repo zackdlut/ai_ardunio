@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     )
     repair_frame_max_side: int = Field(default=1280, alias="REPAIR_FRAME_MAX_SIDE")
     repair_box_format: RepairBoxFormat = Field(default="norm1000", alias="REPAIR_BOX_FORMAT")
+    repair_tracking: bool = Field(default=True, alias="REPAIR_TRACKING")
+    repair_track_features: int = Field(default=1000, ge=200, le=5000, alias="REPAIR_TRACK_FEATURES")
+    repair_track_min_inliers: int = Field(default=18, ge=6, le=200, alias="REPAIR_TRACK_MIN_INLIERS")
+    repair_debug: bool = Field(default=False, alias="REPAIR_DEBUG")
+    repair_debug_dir: Path = Field(
+        default=ROOT_DIR / "data" / "repair_debug", alias="REPAIR_DEBUG_DIR"
+    )
 
     @field_validator(
         "asr_backend", "asr_api_mode", "llm_vision", "yolo_device", "repair_box_format", mode="before"

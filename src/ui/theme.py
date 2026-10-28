@@ -20,6 +20,14 @@ COLOR_ACCENT_INK = "#137A52"
 COLOR_USER_BUBBLE = "#E7F6EF"
 COLOR_THINK = "#5E6D66"
 COLOR_VIEWPORT = "#1A1F1C"
+COLOR_FAULT = "#B3261E"
+COLOR_FAULT_SOFT = "#FCF1F0"
+COLOR_CAUTION = "#B07A10"
+COLOR_CAUTION_SOFT = "#FDF6E8"
+COLOR_TRACK_EMPTY = "#DCE5E0"
+# Readings and step counters: what an instrument shows is set in mono.
+FONT_MONO = '"Cascadia Mono", "Consolas", monospace'
+FONT_MONO_FAMILIES = ["Cascadia Mono", "Consolas"]
 
 
 def app_stylesheet() -> str:
@@ -390,6 +398,19 @@ def app_stylesheet() -> str:
         background: #F7FAF8;
     }}
 
+    QPushButton:disabled,
+    QPushButton#voiceButton:disabled {{
+        color: #B5C0BA;
+        border-color: #E8EEEA;
+        background: transparent;
+    }}
+
+    QPushButton#primaryButton:disabled {{
+        background-color: #8ACFAF;
+        border-color: #8ACFAF;
+        color: #FFFFFF;
+    }}
+
     QPushButton#voiceButton:checked {{
         background-color: {COLOR_ACCENT_SOFT};
         border-color: {COLOR_ACCENT};
@@ -428,6 +449,80 @@ def app_stylesheet() -> str:
         padding: 8px 10px;
         color: {COLOR_TEXT};
         font-size: 12px;
+    }}
+
+    QFrame#guideCard QLabel {{
+        background: transparent;
+        border: none;
+    }}
+
+    QLabel#readout {{
+        font-family: {FONT_MONO};
+        font-size: 13px;
+        font-weight: 700;
+        color: {COLOR_ACCENT_INK};
+    }}
+
+    QLabel#readoutMuted {{
+        font-family: {FONT_MONO};
+        font-size: 12px;
+        color: {COLOR_TEXT_MUTED};
+    }}
+
+    QLabel#guideStepTitle {{
+        font-size: 15px;
+        font-weight: 700;
+        color: {COLOR_TEXT};
+    }}
+
+    QLabel#guideInstruction {{
+        font-size: 13px;
+        color: {COLOR_TEXT};
+    }}
+
+    QLabel#guideVerify {{
+        font-size: 12px;
+        color: {COLOR_THINK};
+        padding: 5px 8px;
+        background-color: #EEF4F1;
+        border-radius: 6px;
+    }}
+
+    QLabel#guideFeedback {{
+        font-size: 12px;
+        font-weight: 600;
+        padding: 6px 8px;
+        border-radius: 6px;
+        color: {COLOR_ACCENT_INK};
+        background-color: {COLOR_ACCENT_SOFT};
+    }}
+
+    QLabel#guideFeedback[tone="fail"] {{
+        color: {COLOR_FAULT};
+        background-color: {COLOR_FAULT_SOFT};
+    }}
+
+    QLabel#trackChip {{
+        font-size: 11px;
+        font-weight: 600;
+        padding: 0 2px;
+        color: {COLOR_TEXT_MUTED};
+    }}
+
+    QLabel#eventEyebrow {{
+        font-size: 11px;
+        font-weight: 700;
+    }}
+
+    QLabel#eventTitle {{
+        font-size: 13px;
+        font-weight: 600;
+        color: {COLOR_TEXT};
+    }}
+
+    QLabel#eventDetail {{
+        font-size: 12px;
+        color: {COLOR_THINK};
     }}
 
     QDialog#settingsDialog {{

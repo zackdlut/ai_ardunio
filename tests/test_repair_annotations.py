@@ -51,7 +51,15 @@ def test_unusable_boxes_are_dropped() -> None:
 
 def test_annotation_defaults_and_kind() -> None:
     ann = make_annotation({"box": [0, 0, 500, 500], "kind": "FAULT", "check_id": "3"})
-    assert ann == {"label": "检查点", "kind": "fault", "box": [0.0, 0.0, 0.5, 0.5], "note": "", "check_id": 3}
+    ann.pop("id")
+    assert ann == {
+        "type": "rect",
+        "label": "检查点",
+        "kind": "fault",
+        "pts": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]],
+        "note": "",
+        "check_id": 3,
+    }
     assert make_annotation({"box": [0, 0, 500, 500], "kind": "weird"})["kind"] == "check"
 
 

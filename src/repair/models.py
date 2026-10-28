@@ -45,6 +45,26 @@ class RepairCheck(Base):
     )
 
 
+class RepairGuide(Base):
+    """A step-by-step operation shown as AR shapes, one step at a time."""
+
+    __tablename__ = "repair_guides"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    case_id: Mapped[int] = mapped_column(Integer, index=True)
+    check_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    steps: Mapped[str] = mapped_column(Text, default="[]")
+    current_step: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    board_box: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
 class RepairDocument(Base):
     __tablename__ = "repair_documents"
 

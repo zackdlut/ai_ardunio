@@ -6,6 +6,7 @@ from typing import Any, Tuple
 import cv2
 import numpy as np
 
+from overlay.ar_shapes import draw_shapes
 from overlay.text_sprite import TextSpriteCache, blit_bgra
 from vision.component_db import display_name
 from vision.detector import Detection
@@ -30,11 +31,11 @@ _HAND_LINKS = (
     (5, 9), (9, 13), (13, 17),
 )
 _RED = (60, 64, 235)
-_ANNOTATION_COLORS = {
-    "check": _AMBER,
-    "fault": _RED,
-    "ok": _ACCENT,
-    "danger": (40, 40, 220),
+_TRACK_BADGES = {
+    "frozen": ("已定格", _AMBER),
+    "tracking": ("跟踪中", _ACCENT),
+    "weak": ("跟踪弱", _AMBER),
+    "lost": ("跟丢了", _RED),
 }
 _PIN_ZONES = {
     "D13": (0.72, 0.15, 0.82, 0.28),
@@ -125,59 +126,40 @@ class OverlayEngine:
         mode: str = "tutor",
         annotations: list[dict[str, Any]] | None = None,
         frozen: bool = False,
+        transform: np.ndarray | None = None,
+        shape_alpha: float = 1.0,
+        track_status: str = "",
     ) -> np.ndarray:
+        """``annotations`` are repair shapes in reference 0..1 coordinates;
+        ``transform`` carries them onto this frame (None = identity)."""
         out = frame.copy()
         hint = hint or {}
         repair = mode == "repair"
         if repair:
-            self._draw_annotations(out, annotations or [], hint.get("check_id"), pulse)
+            draw_shapes(
+                out,
+                annotations or [],
+                self._label,
+                H=transform,
+                pulse=pulse,
+                focus_check=hint.get("check_id"),
+                alpha=shape_alpha,
+            )
         else:
             self._draw_detections(out, detections)
             self._draw_guide(out, detections, hint, pulse)
         self._draw_hand(out, hand)
         self._draw_marks(out, marks or [], pulse)
-        self._draw_hud(out, hint, paused, bool(marks), repair=repair, frozen=frozen)
+        self._draw_hud(
+            out,
+            hint,
+            paused,
+            bool(marks),
+            repair=repair,
+            frozen=frozen,
+            track_status=track_status if repair and annotations else "",
+        )
         return out
-
-    def _draw_annotations(
-        self,
-        frame: np.ndarray,
-        annotations: list[dict[str, Any]],
-        focus_check: Any,
-        pulse: float,
-    ) -> None:
-        height, width = frame.shape[:2]
-        wave = 0.5 + 0.5 * math.sin(pulse * math.tau)
-        for item in annotations:
-            try:
-                bx1, by1, bx2, by2 = (float(v) for v in item.get("box") or ())
-            except (TypeError, ValueError):
-                continue
-            x1, y1 = int(bx1 * (width - 1)), int(by1 * (height - 1))
-            x2, y2 = int(bx2 * (width - 1)), int(by2 * (height - 1))
-            if x2 - x1 < 2 or y2 - y1 < 2:
-                continue
-            kind = str(item.get("kind") or "check")
-            color = _ANNOTATION_COLORS.get(kind, _AMBER)
-            focused = focus_check is not None and item.get("check_id") == focus_check
-            thickness = 3 if focused or kind == "fault" else 2
-            if kind == "danger":
-                _hatch(frame, x1, y1, x2, y2, color, 0.35)
-            elif kind == "fault" or focused:
-                self._tint_box(frame, [x1, y1, x2, y2], color, 0.12 + 0.18 * wave)
-            if kind == "fault":
-                pad = int(2 + 4 * wave)
-                cv2.rectangle(
-                    frame, (x1 - pad, y1 - pad), (x2 + pad, y2 + pad), color, 1, cv2.LINE_AA
-                )
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
-            label = str(item.get("label") or "")
-            note = str(item.get("note") or "")
-            if note and (focused or kind in ("fault", "danger")):
-                label = f"{label} · {note}" if label else note
-            if label:
-                ly = y1 - 26 if y1 >= 30 else min(y2 + 4, height - 24)
-                self._label(frame, label, x1, max(4, ly), color, max_width=max(120, width // 2))
 
     def _draw_detections(
         self,
@@ -224,6 +206,12 @@ class OverlayEngine:
             self._tint_box(frame, box, _ACCENT, alpha)
             x1, y1, x2, _y2 = box
             self._arrow(frame, ((x1 + x2) // 2, y1 - 56), ((x1 + x2) // 2, y1), "", _ACCENT)
+
+    def render_marks(self, frame: np.ndarray, marks: list[dict[str, Any]]) -> np.ndarray:
+        """Just the user's marks on a clean frame (what the repair model gets to see)."""
+        out = frame.copy()
+        self._draw_marks(out, marks, 0.25)
+        return out
 
     def _draw_hand(self, frame: np.ndarray, hand: list[tuple[float, float]] | None) -> None:
         if not hand or len(hand) < 21:
@@ -299,6 +287,7 @@ class OverlayEngine:
         has_marks: bool,
         repair: bool = False,
         frozen: bool = False,
+        track_status: str = "",
     ) -> None:
         height, width = frame.shape[:2]
         if height < 48 or width < 80:
@@ -317,14 +306,25 @@ class OverlayEngine:
             guide = str(hint.get("hint") or fallback).strip()
             headline = f"{step}  ·  {guide}" if step else guide
         badge_w = 0
-        if frozen:
-            badge = "已定格"
-            badge_w = 84
-            self._label(frame, badge, width - badge_w, 10, _AMBER, px=18)
+        badge = _TRACK_BADGES.get("frozen" if frozen else track_status)
+        if badge:
+            text, color = badge
+            badge_w = 92
+            self._label(frame, text, width - badge_w, 10, color, px=18)
         self._label(frame, headline, 12, 8, _INK, px=20, max_width=width - 24 - badge_w)
 
         status = str(hint.get("status_text") or "").strip()
-        if status and not paused and hint.get("status") == "missing" and height >= 180:
+        if repair and track_status == "lost" and not frozen and height >= 180:
+            self._label(
+                frame,
+                "跟丢了：把板子移回原来的位置，或点「重新对准」",
+                12,
+                bar_h + 6,
+                _RED,
+                px=17,
+                max_width=width - 24,
+            )
+        elif status and not paused and hint.get("status") == "missing" and height >= 180:
             self._label(frame, status, 12, bar_h + 6, _AMBER, px=16, max_width=width - 24)
 
         if not has_marks and height >= 220:
@@ -346,8 +346,19 @@ class OverlayEngine:
         bgr: tuple[int, int, int],
         px: int = 18,
         max_width: int = 0,
+        bg: tuple[int, int, int] | None = None,
     ) -> None:
         sprite = self._text.get(text, bgr, px=px, max_width=max_width)
+        if sprite is not None and bg is not None:
+            h, w = sprite.shape[:2]
+            fh, fw = frame.shape[:2]
+            x0, y0 = max(0, x - 5), max(0, y - 2)
+            x1, y1 = min(fw, x + w + 5), min(fh, y + h + 2)
+            if x1 > x0 and y1 > y0:
+                roi = frame[y0:y1, x0:x1]
+                tint = np.empty_like(roi)
+                tint[:] = bg
+                cv2.addWeighted(tint, 0.62, roi, 0.38, 0, roi)
         if sprite is None:
             cv2.putText(
                 frame,
@@ -423,26 +434,6 @@ def _corners(
     cv2.line(frame, (x1, y2), (x1, y2 - length), color, thickness, cv2.LINE_AA)
     cv2.line(frame, (x2, y2), (x2 - length, y2), color, thickness, cv2.LINE_AA)
     cv2.line(frame, (x2, y2), (x2, y2 - length), color, thickness, cv2.LINE_AA)
-
-
-def _hatch(
-    frame: np.ndarray,
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    color: tuple[int, int, int],
-    alpha: float,
-) -> None:
-    x1, y1, x2, y2 = _clip_box([x1, y1, x2, y2], frame.shape[1], frame.shape[0])
-    if x2 - x1 < 2 or y2 - y1 < 2:
-        return
-    roi = frame[y1:y2, x1:x2]
-    lines = roi.copy()
-    h, w = roi.shape[:2]
-    for offset in range(-h, w, 14):
-        cv2.line(lines, (offset, h), (offset + h, 0), color, 2, cv2.LINE_AA)
-    cv2.addWeighted(lines, alpha, roi, 1 - alpha, 0, roi)
 
 
 def _fill_bar(

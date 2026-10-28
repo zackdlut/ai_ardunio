@@ -173,3 +173,43 @@ class RoundedCard(QFrame):
         painter.setBrush(QColor(COLOR_SURFACE))
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         painter.drawRoundedRect(rect, self._radius, self._radius)
+
+
+class RailCard(QFrame):
+    """Rounded card with a colored rail down its left edge; the rail color carries state."""
+
+    def __init__(
+        self,
+        rail: str = COLOR_ACCENT,
+        fill: str = COLOR_SURFACE,
+        radius: float = 10,
+        rail_width: float = 3,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._rail = QColor(rail)
+        self._fill = QColor(fill)
+        self._radius = radius
+        self._rail_width = rail_width
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+
+    def set_tone(self, rail: str, fill: str | None = None) -> None:
+        self._rail = QColor(rail)
+        if fill is not None:
+            self._fill = QColor(fill)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, self._radius, self._radius)
+        painter.setPen(QPen(QColor(COLOR_BORDER)))
+        painter.setBrush(self._fill)
+        painter.drawPath(path)
+        painter.setClipPath(path)
+        painter.fillRect(QRectF(rect.left(), rect.top(), self._rail_width, rect.height()), self._rail)
+        painter.end()

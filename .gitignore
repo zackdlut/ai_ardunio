@@ -15,4 +15,5 @@ dataset/
 runs/
 data/*.db
 data/repair_docs/
+data/repair_debug/
 *.log

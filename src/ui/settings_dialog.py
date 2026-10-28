@@ -31,6 +31,11 @@ REPAIR_KEYS = frozenset(
         "REPAIR_DOCS_DIR",
         "REPAIR_FRAME_MAX_SIDE",
         "REPAIR_BOX_FORMAT",
+        "REPAIR_TRACKING",
+        "REPAIR_TRACK_FEATURES",
+        "REPAIR_TRACK_MIN_INLIERS",
+        "REPAIR_DEBUG",
+        "REPAIR_DEBUG_DIR",
     }
 )
 
@@ -234,15 +239,35 @@ class SettingsDialog(QDialog):
         self._repair_side.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self._repair_side.setValue(int(cfg.repair_frame_max_side))
         self._repair_box = _choice(_BOX_FORMATS, cfg.repair_box_format)
+        self._repair_tracking = _choice(_ON_OFF, "true" if cfg.repair_tracking else "false")
+        self._track_features = QSpinBox()
+        self._track_features.setRange(200, 5000)
+        self._track_features.setSingleStep(100)
+        self._track_features.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self._track_features.setValue(int(cfg.repair_track_features))
+        self._track_inliers = QSpinBox()
+        self._track_inliers.setRange(6, 200)
+        self._track_inliers.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self._track_inliers.setValue(int(cfg.repair_track_min_inliers))
         _row(form, "iFixit 查询", self._ifixit_enabled)
         _row(form, "iFixit 地址", self._ifixit_url)
         _row(form, "iFixit 超时", self._ifixit_timeout)
         _row(form, "资料存放目录", self._repair_docs)
         _row(form, "附图长边", self._repair_side)
         _row(form, "标注坐标格式", self._repair_box)
+        _row(form, "图形跟踪板子", self._repair_tracking)
+        _row(form, "跟踪特征点数", self._track_features)
+        _row(form, "最少匹配点", self._track_inliers)
+        self._repair_debug = _choice(_ON_OFF, "true" if cfg.repair_debug else "false")
+        self._repair_debug_dir = _line(str(cfg.repair_debug_dir), "data/repair_debug")
+        _row(form, "调试记录", self._repair_debug)
+        _row(form, "调试记录目录", self._repair_debug_dir)
         form.addRow(_note(
             "iFixit 是外网服务，经 HTTPS_PROXY 出网。附图长边越大，丝印看得越清，请求也越大。"
             "标注坐标格式要与视觉模型的输出习惯一致，框总是偏移时可以换一种试试。"
+            "图形跟踪用板子上的纹理把图形贴住：特征点越多越稳但越耗 CPU；"
+            "最少匹配点调高能减少误跟，调低在纹理少的板子上更不容易跟丢。"
+            "调试记录会把每轮发给模型的图片、模型的原始坐标和画出的结果存到目录里，标注不准时打开对照。"
         ))
         return page
 
@@ -279,6 +304,11 @@ class SettingsDialog(QDialog):
             "REPAIR_DOCS_DIR": self._repair_docs.text().strip(),
             "REPAIR_FRAME_MAX_SIDE": str(self._repair_side.value()),
             "REPAIR_BOX_FORMAT": self._repair_box.currentData(),
+            "REPAIR_TRACKING": self._repair_tracking.currentData(),
+            "REPAIR_TRACK_FEATURES": str(self._track_features.value()),
+            "REPAIR_TRACK_MIN_INLIERS": str(self._track_inliers.value()),
+            "REPAIR_DEBUG": self._repair_debug.currentData(),
+            "REPAIR_DEBUG_DIR": self._repair_debug_dir.text().strip(),
         }
 
     def _save(self) -> None:

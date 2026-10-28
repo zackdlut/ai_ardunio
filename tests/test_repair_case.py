@@ -89,7 +89,8 @@ def test_tools_drive_case_overlay_and_documents(cases: CaseManager, tmp_path: Pa
     )
     assert result["marked_on_screen"] == 1
     first, second = (item["id"] for item in result["added"])
-    assert ctx.annotations[0]["check_id"] == first and ctx.annotations[0]["box"] == [0.0, 0.0, 0.3, 0.3]
+    assert ctx.annotations[0]["check_id"] == first
+    assert ctx.annotations[0]["pts"] == [[0.0, 0.0], [0.3, 0.0], [0.3, 0.3], [0.0, 0.3]]
 
     recorded = json.loads(tools["record_check_result"](check_id=first, status="fail", measured="0V"))
     assert recorded["next_check"]["id"] == second
@@ -97,7 +98,7 @@ def test_tools_drive_case_overlay_and_documents(cases: CaseManager, tmp_path: Pa
     assert ctx.case()["current_check_id"] == second
 
     drawn = json.loads(tools["annotate"](items=[{"label": "C3", "box": [400, 400, 500, 500]}, {"label": "x", "box": "?"}]))
-    assert drawn["drawn"] == ["C3"] and "skipped" in drawn
+    assert drawn["drawn"] == ["rect C3"] and "skipped" in drawn
     assert "已清除" in tools["clear_annotations"]()
     assert ctx.annotations == []
 

@@ -9,6 +9,24 @@ _BOX_FORMAT_TEXT = {
     "norm1": "0 到 1 的相对坐标（左上角为 0,0，右下角为 1,1）",
     "pixel": "所附图片的像素坐标",
 }
+_STEP_TEXT = {"pending": "未做", "done": "已完成", "failed": "未通过", "skipped": "跳过"}
+_TRACK_TEXT = {
+    "tracking": "实时画面，图形已贴在板子上跟随移动",
+    "weak": "实时画面，跟踪信号弱，图形可能轻微漂移",
+    "lost": "实时画面，跟踪已丢失，旧图形可能错位，必要时重新标注",
+    "off": "实时画面，跟踪已关闭，用户移动设备后图形会错位",
+}
+
+
+def _in_format(
+    point: list[float], box_format: str, image_size: tuple[int, int] | None
+) -> list[float]:
+    x, y = float(point[0]), float(point[1])
+    if box_format == "norm1":
+        return [round(x, 3), round(y, 3)]
+    if box_format == "pixel" and image_size:
+        return [round(x * image_size[0]), round(y * image_size[1])]
+    return [round(x * 1000), round(y * 1000)]
 
 
 def build_repair_extra_system(
@@ -21,6 +39,10 @@ def build_repair_extra_system(
     box_format: str = "norm1000",
     frozen: bool = False,
     ifixit_enabled: bool = True,
+    guide: dict[str, Any] | None = None,
+    track_status: str = "",
+    image_size: tuple[int, int] | None = None,
+    clean_image: bool = False,
 ) -> str:
     parts = ["【当前维修上下文】"]
     if case:
@@ -67,12 +89,43 @@ def build_repair_extra_system(
     if not ifixit_enabled:
         parts.append("iFixit 查询已在设置中关闭。")
 
+    def located(shape: dict[str, Any]) -> dict[str, Any]:
+        out = {
+            k: v
+            for k, v in shape.items()
+            if k in ("id", "type", "label", "kind", "note", "check_id", "text", "meter", "expected") and v
+        }
+        pts = shape.get("pts") or []
+        if pts and has_image:
+            out["pts"] = [_in_format(p, box_format, image_size) for p in pts]
+        return out
+
+    if guide and guide.get("status") == "active" and guide.get("steps"):
+        steps = guide["steps"]
+        current = min(max(int(guide.get("current_step") or 0), 0), len(steps) - 1)
+        parts.append(f"进行中的指引 #{guide['id']}「{guide.get('title')}」，共 {len(steps)} 步:")
+        for i, step in enumerate(steps):
+            status = _STEP_TEXT.get(step.get("status"), step.get("status"))
+            line = f"  {i + 1}. {step.get('title')} [{status}]"
+            if step.get("feedback"):
+                line += f" 反馈: {step['feedback']}"
+            if i == current:
+                line += "  ← 当前步"
+            parts.append(line)
+        step = steps[current]
+        parts.append(f"当前步说明: {step.get('instruction') or '无'}")
+        parts.append(f"当前步判断标准(verify): {step.get('verify') or '未写，按说明判断'}")
+        if step.get("shapes"):
+            parts.append(
+                "当前步画面图形（pts 为图形各点，rect/circle 是四角 左上,右上,右下,左下）: "
+                + json.dumps([located(s) for s in step["shapes"]], ensure_ascii=False)
+            )
+
     if annotations:
-        compact = [
-            {k: v for k, v in item.items() if k in ("label", "kind", "note", "check_id")}
-            for item in annotations
-        ]
-        parts.append("画面上当前的标注: " + json.dumps(compact, ensure_ascii=False))
+        parts.append(
+            "画面上的其他标注: "
+            + json.dumps([located(s) for s in annotations], ensure_ascii=False)
+        )
 
     if user_marks:
         compact = [{k: v for k, v in mark.items() if k != "points"} for mark in user_marks]
@@ -83,14 +136,29 @@ def build_repair_extra_system(
         parts.append("用户问「这里」或「标记 N」时，按这些坐标回答。")
 
     fmt = _BOX_FORMAT_TEXT.get(box_format, _BOX_FORMAT_TEXT["norm1000"])
-    parts.append(f"annotate 和 propose_checklist 的 box 一律写成 [x1,y1,x2,y2]，使用{fmt}。")
+    parts.append(
+        f"所有坐标使用{fmt}：box 写成 [x1,y1,x2,y2]，at/from/to/red/black 等点写成 [x,y]。"
+    )
 
     if has_image:
-        state = "已定格，标注会固定在这张图上" if frozen else "是实时画面，用户移动设备后标注会错位"
+        if frozen:
+            state = "已定格，图形固定在这张图上"
+        else:
+            state = _TRACK_TEXT.get(track_status, "实时画面")
+        if clean_image:
+            overlay = (
+                "附图是干净的摄像头原始画面，没有画已有图形，只叠加了用户的「标记 N」（橙色圆圈、方框和圈线）。"
+                "已有图形的位置见上面列出的坐标。"
+            )
+        else:
+            overlay = (
+                "画面上的彩色框、箭头、虚线、表笔圆点、编号、顶部提示条、「标记 N」"
+                "以及橙色方框和圈线都是程序叠加的，不是实物。"
+            )
         parts.append(
-            f"这条消息附了一张当前摄像头画面（{state}）。画面上的彩色框、编号、顶部提示条、"
-            "「标记 N」以及橙色方框和圈线都是程序叠加的，不是实物。"
-            "坐标按整张图计算。丝印、焊点看不清时请用户拉近镜头或补光，不要猜。"
+            f"这条消息附了一张当前摄像头画面（{state}）。{overlay}"
+            "坐标按整张图计算，上面列出的图形坐标也已换算到这张图上。"
+            "丝印、焊点看不清时先用 zoom_view 放大；还看不清就请用户拉近镜头或补光，不要猜。"
         )
     else:
         parts.append("这条消息没有附画面，无法给出画面坐标，只能文字指导。")

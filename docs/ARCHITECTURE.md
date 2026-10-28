@@ -763,6 +763,9 @@ TTS 只有本机后端（pyttsx3 / Windows SAPI），音色与语速为 `TTS_VOI
 | `REPAIR_DOCS_DIR` | 上传资料存放目录，默认 `data/repair_docs` |
 | `REPAIR_FRAME_MAX_SIDE` | 维修模式附图长边，默认 `1280` |
 | `REPAIR_BOX_FORMAT` | 模型输出框的坐标约定：`norm1000`（默认）/ `norm1` / `pixel` |
+| `REPAIR_TRACKING` | AR 图形是否跟踪板子（ORB + 单应性），默认 `true` |
+| `REPAIR_TRACK_FEATURES` / `REPAIR_TRACK_MIN_INLIERS` | 跟踪每帧特征点数（默认 1000）、判定跟上所需的最少 RANSAC 内点（默认 18） |
+| `REPAIR_DEBUG` / `REPAIR_DEBUG_DIR` | 维修调试记录开关（默认关）和目录（默认 `data/repair_debug`），见 14.7 |
 
 顶栏「设置」打开 `SettingsDialog`（`src/ui/settings_dialog.py`），可编辑上表中 `OPENAI_*`、`LLM_*`、`ASR_*`、`WHISPER_*`、`OLLAMA_*` 各项，以及「维修模式」页的 `IFIXIT_*`、`REPAIR_*`。保存时只取有改动的键，先用 `Settings(**改动)` 校验，失败就在窗口内提示、不写文件；通过后由 `config/env_file.py` 原位改写 `.env`（保留注释与顺序，新键追加到末尾），同时写入 `os.environ`，因为进程环境变量优先于 `.env`。主窗口随后刷新 ASR 菜单提示并重建 ASR；对话相关键有变化时更新模型标签并新起 `LLMConnectWorker`，只接受最新一次连接的结果。
 
@@ -796,7 +799,7 @@ TTS 只有本机后端（pyttsx3 / Windows SAPI），音色与语速为 `TTS_VOI
 | 附加上下文 | `build_extra_system` | `build_repair_extra_system`：维修单、清单状态与实测值、资料列表、当前标注、用户标记、坐标约定 |
 | 附图长边 | `LLM_FRAME_MAX_SIDE`（768） | `REPAIR_FRAME_MAX_SIDE`（1280，看得清丝印） |
 | 工具轮次上限 | 6 | 10 |
-| 手势「赞」 | 下一步 | 下一个待查项 |
+| 手势「赞」 | 下一步 | 有指引时「做好了，请确认」，否则下一个待查项 |
 
 切换模式会清空对话记忆和画面标记；进行中的回复会被取消。手势检测在两种模式下都照常运行。
 
@@ -810,16 +813,16 @@ flowchart LR
     Tools --> IFX[IFixitClient httpx]
     Tools -->|on_change| Bridge[_RepairBridge.changed]
     Bridge --> Panel[RepairPanel 刷新]
-    Bridge --> Cam[CameraWorker set_annotations / set_overlay_hint]
+    Bridge --> Cam[CameraWorker set_shapes / set_overlay_hint]
     Lib -->|pending_images| Worker
 ```
 
 ### 14.2 画面标注
 
-- 模型调用 `annotate` 或带 `box` 的 `propose_checklist`，框写成 `[x1,y1,x2,y2]`。`repair/annotations.py` 按 `REPAIR_BOX_FORMAT` 换算到 0 到 1：`norm1000`（默认，Qwen-VL 习惯）、`norm1`、`pixel`（按本轮实际发送的图片尺寸 `sent_image_size`）。四个数都不超过 1 时一律按 0 到 1 处理；越界会裁剪，太小或格式不对的框丢弃并在工具结果里说明。
-- `OverlayEngine.render(mode="repair")` 不画 YOLO 框，改画标注：`check` 琥珀色、`fault` 红色脉动、`ok` 绿色、`danger` 红色斜线。当前检查项对应的标注加粗，并显示说明。顶部 HUD 显示「检查 N/M · 标题 · 预期值」。
+- 模型调用 `annotate` 或带 `box` 的 `propose_checklist`，框写成 `[x1,y1,x2,y2]`，点写成 `[x,y]`。`repair/annotations.py` 按 `REPAIR_BOX_FORMAT` 换算到 0 到 1：`norm1000`（默认，Qwen-VL 习惯）、`norm1`、`pixel`（按本轮实际发送的图片尺寸 `sent_image_size`）。数值都不超过 1 时一律按 0 到 1 处理；越界会裁剪，太小或格式不对的图形丢弃并在工具结果里说明。
+- 标注就是 AR 图形（14.7），颜色按 kind：`check` 琥珀色、`fault` 红色脉动、`ok` 绿色、`danger` 红色斜线。当前检查项对应的图形加粗，并显示说明。顶部 HUD 显示「检查 N/M · 标题 · 预期值」，有指引时改为「步骤 N/M · 标题 · 说明」。
 - 回报结果会改标注颜色：异常变 `fault`，正常和跳过变 `ok`，实测值写进说明。
-- **定格画面**：`CameraWorker.set_frozen(True)` 缓存当前帧，之后一直在这张图上叠加标注，发给模型的也是这张图。拿起板子测量时标注不会错位。
+- **定格画面**：`CameraWorker.set_frozen(True)` 缓存当前帧并把它设为跟踪基准，之后一直在这张图上叠加图形，发给模型的也是这张图。取消定格后从这张图继续跟踪。
 
 ### 14.3 维修数据（SQLite）
 
@@ -828,6 +831,7 @@ flowchart LR
 | `repair_cases` | 设备、现象、状态 open/closed、结论、处置步骤（JSON 数组）、安全提醒、当前检查项 |
 | `repair_checks` | 所属维修单、序号、标题、操作说明、预期、位置框（0 到 1 的 JSON）、kind、状态 pending/pass/fail/skip、实测值、备注 |
 | `repair_documents` | 所属维修单（空表示共享）、文件名、存储路径、类型 pdf/image、页数、是否有文字 |
+| `repair_guides` | 所属维修单、可选检查项、标题、步骤（JSON：标题、说明、verify、图形、状态 pending/done/failed/skipped、反馈）、当前步、状态 active/done/cancelled、板子范围、总结 |
 
 `CaseManager` 每次操作开一个短 session，LLM 工作线程和主线程都可调用。启动时自动接上最近一个未关闭的维修单；「新建」会关闭旧单。
 
@@ -838,9 +842,14 @@ flowchart LR
 | `get_repair_case` | 维修单、清单、资料列表、当前标注 |
 | `update_repair_case` | 记录设备与现象，没有维修单就新建 |
 | `propose_checklist` | 追加检查项（`replace_pending` 可替换未查项），有框的同时标在画面 |
+| `zoom_view` | 从全分辨率原始帧裁剪放大一块区域交给模型看，返回 `zoom_id`；画图工具带 `zoom_id` 时坐标按放大图换算回原图 |
 | `focus_check` | 设为当前项 |
 | `record_check_result` | 记录 pass/fail/skip 与实测值，返回下一个待查项 |
-| `annotate` / `clear_annotations` | 画或清除标注，最多保留 12 个，同名或同检查项的会替换 |
+| `annotate` / `clear_annotations` | 画或清除 AR 图形（rect/circle/point/text/arrow/line/probe），最多保留 12 个，同名或同检查项的会替换；可带 `board_box` |
+| `start_guide` | 开始分步指引，每步有说明、verify 和最多 3 个图形；同一维修单只有一个进行中的指引 |
+| `set_guide_step` / `update_guide_step` | 跳到某步；重画某步的图形或改说明 |
+| `confirm_step` | 看附图判断当前步：通过则标记完成并进入下一步，否则记下反馈并追加纠正图形 |
+| `end_guide` | 结束或放弃指引 |
 | `search_documents` | 资料关键词检索，返回文档、页码、片段 |
 | `view_document_page` | 渲染一页或页内局部（`region` 为 0 到 1 范围），作为图片交给模型 |
 | `ifixit_search` / `ifixit_get_guide` / `ifixit_device` | iFixit 搜索、指南步骤（每次最多 12 步，`start_step` 分段）、设备页 |
@@ -868,6 +877,46 @@ flowchart LR
 - 上传：侧栏「上传」选 PDF 或图片，`DocIngestWorker` 在后台复制到 `REPAIR_DOCS_DIR/<随机目录>/`，PDF 逐页抽文字写入 `pages.json`。扫描件抽不到文字，标记为 `has_text=false`，只能看图。
 - 检索：英文和数字按词切分并保留整体（`vcc_3v3` 同时产生 `vcc`、`3v3`），中文两字一组；按词频和稀有度打分，位号、网络名的权重高于中文词。
 - iFixit：`GET /search/{q}?filter=guide|wiki`、`GET /guides/{id}`、`GET /wikis/CATEGORY/{device}`，只读、不需要 Key。httpx 读取环境变量里的代理，因此经 `HTTPS_PROXY` 出网；结果缓存 30 分钟；超时、404、网络错误都返回中文 `error`。iFixit 内容以英文为主，工具描述要求模型用英文设备名搜索，并注明来源。
+
+### 14.7 AR 指引与平面跟踪
+
+**图形**。每个图形是 `{id, type, label, kind, note, pts, …}`，`pts` 是基准帧上 0 到 1 的点，整个图形可以用一个单应矩阵一起变换：
+
+| type | pts | 画法（`overlay/ar_shapes.py`） |
+|------|-----|------|
+| `rect` | 四角 左上、右上、右下、左下 | 变换后的四边形，四角加粗 |
+| `circle` | 外接四边形四角 | 单位圆经「单位正方形→四边形」单应映射，倾斜时仍准确 |
+| `point` / `text` | `[at]` | 脉动圆环 / 带底色文字 |
+| `arrow` | `[from, to]` | 粗线加箭头，线上白色 V 形纹朝箭头方向流动，表示撬、拔、推、拧的方向 |
+| `line` | `[from, to]` | 流动虚线，两端圆点，中间标签 |
+| `probe` | `[red]` 或 `[red, black]` | 红笔红圈「红+」、黑笔深色圈「黑-」，之间虚线，读数卡片「档位 … / 预期 …」 |
+
+旧的 `{box: [...]}` 标注由 `as_shape` 自动当作 `rect`。
+
+**跟踪**（`vision/plane_tracker.py`）。维修模式下推理线程不跑 YOLO，改跑 `PlaneTracker.update`：画面缩到宽 640 提取 ORB，与基准帧用 Hamming 距离 kNN 加比值检验匹配，`findHomography(RANSAC)` 求单应；内点不足、四角投影不凸、面积异常或翻转都算这一帧没跟上。H 统一表示为「基准帧 0..1 → 当前帧 0..1」，与分辨率无关；对单位正方形四角的投影做指数平滑，跳变过大时直接采用新值。状态：`tracking`（内点 ≥ 2 倍门槛）、`weak`、`lost`（连续 0.7 秒没跟上）。基准帧特征只在 ROI 内提取：优先用模型给的 `board_box`，否则取所有图形外扩一倍、至少占画面 40% 的范围，避免背景里不动的纹理拖住跟踪。
+
+```mermaid
+flowchart LR
+    Cap[采集线程 30fps] -->|原始帧| Inf[推理线程 PlaneTracker]
+    Inf -->|H 与状态| Cap
+    Cap -->|图形经 H 投影| Ovl[OverlayEngine]
+    Ask[_start_llm] -->|anchor_snapshot| Snap["raw, shown, H"]
+    Snap -->|rebase H| Ctx[RepairContext]
+    Snap -->|raw + 用户标记 附图| LLM[LLMWorker]
+    LLM -->|zoom_view| Ctx
+    LLM -->|annotate / start_guide / confirm_step| Ctx
+    Ctx -->|current_shapes| Cap
+```
+
+**重新定基准**。每次向模型提问（以及定格、「重新对准」）时，`CameraWorker.anchor_snapshot()` 在一次锁内取出最新的原始帧、显示帧和当前 H：先用 H 把已有图形变换到这张帧的坐标，再把它设为新基准（代号自增，推理线程据此丢弃旧基准算出的结果）。主线程用同一个 H 调 `RepairContext.rebase`，自由标注、指引各步的图形和板子范围一起变换并写回数据库。发给模型的附图是这张原始帧加上用户的「标记 N」（`OverlayEngine.render_marks`），不画已有图形和 HUD：模型看到自己画的框和标签时，容易框到叠加层或认错元件。已有图形只以坐标列在上下文里，与附图同一坐标系。跟丢时 H 是最后一次跟上的位姿，图形停在最后出现的位置；画面上的图形 1.5 秒内淡出，HUD 提示「跟丢了」，板子回到原位会自动恢复。
+
+**分步指引**。`start_guide` 把操作拆成几步，画面只显示自由标注加当前步的图形。侧栏指引卡片显示分段步骤条（每段一步，按状态着色，当前步加高）、等宽读数「02 / 04」、操作说明、确认标准和助手反馈（没通过时卡片左侧色条变红），按钮有「上一步 / 跳过 / 做好了，帮我确认 / 结束」。点「做好了」或竖大拇指时：先取消定格，再自动发一条「我做完了第 N 步…判断标准…请看画面确认」，附上实时画面；模型调用 `confirm_step`，通过就进入下一步，不通过就把反馈显示在卡片和 HUD 上，并在画面上加纠正图形。
+
+**对话里的记录卡片**。程序代发给模型的话（请助手确认、回报检查结果、新建维修单）不显示成用户气泡，而是 `ChatWidget.append_event` 的记录卡片，只写人能看懂的内容，发给模型的完整指令不展示。`MainWindow._announce_guide` 比较指引前后各步的状态与反馈：指引开始、某步确认通过（盖「通过」章）、没通过（盖「未通过」章并写出反馈）、全部通过（盖「完成」章）各出一张卡片；跳过和手动结束由按钮处理函数自己出卡片。语音模式下说「好了」也会走同一条路。
+
+**放大看清**。附图最长边只有 1280，小元件、丝印容易认错。`zoom_view(box)` 从本轮全分辨率原始帧（`RepairContext.anchor_frame`，`begin_turn` 时设置）裁出该区域，外扩 6%，放大到最长边 1280（最多 4 倍），按 14.5 的方式作为图片交给模型，并返回 `zoom_id`。模型在放大图上量坐标，调用 `annotate`、`start_guide`、`update_guide_step`、`confirm_step`、`propose_checklist` 时带上 `zoom_id`，程序按裁剪区域换算回原图。`zoom_id` 只在本轮有效，未知的 id 会报错让模型重来。
+
+**调试记录**（`REPAIR_DEBUG=true`，`repair/debug_log.py`）。每轮在 `REPAIR_DEBUG_DIR/<时间>-t<轮次>/` 下保存：`sent.jpg`（发给模型的附图）、`raw.jpg`（全分辨率原始帧）、`meta.json`（问题、上下文文字、尺寸、坐标格式、跟踪状态）、`tools.jsonl`（每次工具调用的原始参数和结果，含报错）、`img_N.jpg` 与 `images.txt`（放大图、资料页）、`shapes.json` 和 `result.jpg`（本轮结束后的图形画在原始帧上）、`reply.txt`。只保留最近 60 轮。标注不准时对照 `sent.jpg`、`tools.jsonl` 和 `result.jpg`，就能分清是模型认错了东西、坐标量偏了，还是换算出了问题。
 
 ---
 
@@ -920,6 +969,8 @@ curl.exe -s http://10.67.34.44:11434/v1/chat/completions `
 | 维修侧栏 | `src/ui/repair_panel.py` |
 | 维修工具 / 上下文 | `src/agent/repair_tools.py`、`src/agent/repair_context.py` |
 | 维修单 / 资料库 / iFixit / 标注坐标 | `src/repair/case_manager.py`、`models.py`、`documents.py`、`ifixit.py`、`annotations.py` |
+| AR 图形 / 平面跟踪 / 单应工具 | `src/overlay/ar_shapes.py`、`src/vision/plane_tracker.py`、`src/repair/geometry.py` |
+| 维修调试记录 | `src/repair/debug_log.py` |
 | 配置 | `config/settings.py`、`.env` |
 
 ---

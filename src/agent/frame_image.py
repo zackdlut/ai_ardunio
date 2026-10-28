@@ -9,6 +9,17 @@ import cv2
 import numpy as np
 
 
+def fit_frame(frame_bgr: np.ndarray, max_side: int) -> np.ndarray:
+    """Shrink so the longest side is at most ``max_side`` (never enlarges)."""
+    height, width = frame_bgr.shape[:2]
+    longest = max(height, width)
+    if max_side <= 0 or longest <= max_side:
+        return frame_bgr
+    scale = max_side / longest
+    size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return cv2.resize(frame_bgr, size, interpolation=cv2.INTER_AREA)
+
+
 def encode_frame_data_url(
     frame_bgr: np.ndarray | None,
     max_side: int = 768,
@@ -16,12 +27,7 @@ def encode_frame_data_url(
 ) -> str | None:
     if frame_bgr is None or frame_bgr.ndim != 3 or frame_bgr.size == 0:
         return None
-    height, width = frame_bgr.shape[:2]
-    longest = max(height, width)
-    if max_side > 0 and longest > max_side:
-        scale = max_side / longest
-        size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
-        frame_bgr = cv2.resize(frame_bgr, size, interpolation=cv2.INTER_AREA)
+    frame_bgr = fit_frame(frame_bgr, max_side)
     ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     if not ok:
         return None
