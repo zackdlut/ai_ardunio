@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from agent.frame_image import encode_frame_data_url
 from agent.tools import AgentContext, build_openai_tools, build_tool_handlers
 from vision.marks import nearest_component
 from agent.tutor_context import build_extra_system
@@ -119,6 +120,8 @@ class LLMWorker(QThread):
         voice_mode: bool,
         turn: int,
         stream: bool,
+        frame: np.ndarray | None = None,
+        frame_max_side: int = 768,
     ) -> None:
         super().__init__()
         self._client = client
@@ -130,11 +133,14 @@ class LLMWorker(QThread):
         self._voice_mode = voice_mode
         self._turn = turn
         self._stream = stream
+        self._frame = frame
+        self._frame_max_side = frame_max_side
 
     def run(self) -> None:
         if self.isInterruptionRequested():
             return
         try:
+            image_url = encode_frame_data_url(self._frame, self._frame_max_side)
             if self._stream:
                 reply = self._client.chat_with_tools_stream(
                     self._message,
@@ -147,6 +153,7 @@ class LLMWorker(QThread):
                     on_reasoning=lambda text: self.reasoning.emit(self._turn, text),
                     on_revoke=lambda: self.revoke.emit(self._turn),
                     should_stop=self.isInterruptionRequested,
+                    image_url=image_url,
                 )
             else:
                 reply = self._client.chat_with_tools(
@@ -157,6 +164,7 @@ class LLMWorker(QThread):
                     history=self._history,
                     voice_mode=self._voice_mode,
                     should_stop=self.isInterruptionRequested,
+                    image_url=image_url,
                 )
             if not self.isInterruptionRequested():
                 self.succeeded.emit(self._turn, reply)
@@ -556,14 +564,22 @@ class MainWindow(QMainWindow):
         if force or self._tts_on():
             self._tts.speak(prepare_speech_text(text))
 
-    def _extra_system_for_chat(self, voice_mode: bool) -> str:
+    def _extra_system_for_chat(self, voice_mode: bool, has_image: bool) -> str:
         return build_extra_system(
             self._state_machine.progress(),
             self._verify_ok,
             self._verify_msg,
             self._scene,
             voice_mode,
+            has_image=has_image,
         )
+
+    def _frame_for_chat(self) -> np.ndarray | None:
+        if not self._settings.llm_send_frame or self._llm is None:
+            return None
+        if self._llm.supports_vision is False:
+            return None
+        return self._camera_widget.latest_frame()
 
     def _detections_json(self) -> list[dict]:
         return [
@@ -1067,7 +1083,8 @@ class MainWindow(QMainWindow):
             self._chat.set_voice_status("老师在想")
             self._voice_session.set_mode("monitor")
             self._voice_session.set_barge_enabled(True)
-        extra = self._extra_system_for_chat(voice_mode)
+        frame = self._frame_for_chat()
+        extra = self._extra_system_for_chat(voice_mode, has_image=frame is not None)
         self._llm_worker = LLMWorker(
             self._llm,  # type: ignore[arg-type]
             text,
@@ -1078,6 +1095,8 @@ class MainWindow(QMainWindow):
             voice_mode,
             turn,
             stream,
+            frame=frame,
+            frame_max_side=self._settings.llm_frame_max_side,
         )
         _keep_alive(self._llm_worker)
         self._llm_worker.delta.connect(self._on_llm_delta)

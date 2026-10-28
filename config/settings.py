@@ -23,6 +23,8 @@ class Settings(BaseSettings):
         default="http://127.0.0.1:11434/v1", alias="OPENAI_BASE_URL"
     )
     openai_model: str = Field(default="qwen3.8:27b", alias="OPENAI_MODEL")
+    llm_send_frame: bool = Field(default=True, alias="LLM_SEND_FRAME")
+    llm_frame_max_side: int = Field(default=768, alias="LLM_FRAME_MAX_SIDE")
 
     asr_backend: AsrBackend = Field(default="local", alias="ASR_BACKEND")
     whisper_model_size: str = Field(default="small", alias="WHISPER_MODEL_SIZE")

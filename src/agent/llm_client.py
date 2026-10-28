@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from openai import OpenAI
+import httpx
+from openai import BadRequestError, OpenAI
 
+from agent.frame_image import drop_images, user_message as build_user_message
 from agent.prompts import SYSTEM_PROMPT
 from agent.think_stream import ThinkSplitter
 from config.settings import get_settings
@@ -40,6 +42,9 @@ class LLMClient:
             base_url=settings.openai_base_url,
         )
         self._model = settings.openai_model
+        self._base_url = settings.openai_base_url
+        # None means the server did not say; the image is sent and dropped if rejected.
+        self.supports_vision: bool | None = None
 
     def health_check(self) -> tuple[bool, str]:
         try:
@@ -47,9 +52,73 @@ class LLMClient:
             names = {model.id for model in page}
             if self._model not in names:
                 return False, f"LLM 已连接，但未找到模型 {self._model}"
-            return True, "LLM 连接正常"
         except Exception as exc:  # noqa: BLE001
             return False, f"LLM 连接失败: {exc}（请检查 OPENAI_BASE_URL 与 NO_PROXY）"
+        self.supports_vision = self._probe_vision()
+        if self.supports_vision:
+            return True, "LLM 连接正常，可以看摄像头画面"
+        if self.supports_vision is False:
+            return True, "LLM 连接正常（该模型不支持图片，只发送检测结果）"
+        return True, "LLM 连接正常"
+
+    def _probe_vision(self) -> bool | None:
+        """Ask Ollama's /api/show for capabilities. Other servers return None."""
+        root = self._base_url.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        try:
+            response = httpx.post(f"{root}/api/show", json={"model": self._model}, timeout=3.0)
+            response.raise_for_status()
+            caps = response.json().get("capabilities")
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(caps, list):
+            return None
+        return "vision" in caps
+
+    def _build_messages(
+        self,
+        user_message: str,
+        extra_system: str,
+        history: list[dict[str, str]] | None,
+        max_history_messages: int,
+        image_url: str | None,
+    ) -> list[dict[str, Any]]:
+        system_content = SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
+        prior = list(history or [])[-max_history_messages:]
+        if self.supports_vision is False:
+            image_url = None
+        return [
+            {"role": "system", "content": system_content},
+            *prior,
+            build_user_message(user_message, image_url),
+        ]
+
+    def _create(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        completion_kwargs: dict[str, Any],
+        first_round: bool,
+        **extra: Any,
+    ):
+        def call():
+            return self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                tools=tools if tools else None,
+                **completion_kwargs,
+                **extra,
+            )
+
+        try:
+            return call()
+        except BadRequestError:
+            # Only before any tool ran: a retry must not repeat compile_and_upload.
+            if not first_round or not drop_images(messages):
+                raise
+            self.supports_vision = False
+            return call()
 
     def chat_with_tools(
         self,
@@ -62,26 +131,20 @@ class LLMClient:
         max_rounds: int = 6,
         max_history_messages: int = 20,
         should_stop: Callable[[], bool] | None = None,
+        image_url: str | None = None,
     ) -> str:
-        system_content = SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
-        prior = list(history or [])[-max_history_messages:]
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_content},
-            *prior,
-            {"role": "user", "content": user_message},
-        ]
+        messages = self._build_messages(
+            user_message, extra_system, history, max_history_messages, image_url
+        )
         completion_kwargs: dict[str, Any] = {}
         if voice_mode:
             completion_kwargs["max_tokens"] = 512
 
-        for _ in range(max_rounds):
+        for round_index in range(max_rounds):
             if should_stop and should_stop():
                 return ""
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                tools=tools if tools else None,
-                **completion_kwargs,
+            response = self._create(
+                messages, tools, completion_kwargs, first_round=round_index == 0
             )
             msg = response.choices[0].message
             tool_calls = msg.tool_calls or []
@@ -147,15 +210,12 @@ class LLMClient:
         on_reasoning: Callable[[str], None] | None = None,
         on_revoke: Callable[[], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        image_url: str | None = None,
     ) -> str:
         """Stream the spoken answer. Thinking tokens go to ``on_reasoning``."""
-        system_content = SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
-        prior = list(history or [])[-max_history_messages:]
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_content},
-            *prior,
-            {"role": "user", "content": user_message},
-        ]
+        messages = self._build_messages(
+            user_message, extra_system, history, max_history_messages, image_url
+        )
         completion_kwargs: dict[str, Any] = {}
         if voice_mode:
             completion_kwargs["max_tokens"] = 512
@@ -187,13 +247,14 @@ class LLMClient:
         on_revoke: Callable[[], None] | None,
         should_stop: Callable[[], bool] | None,
     ) -> str:
-        for _ in range(max_rounds):
+        for round_index in range(max_rounds):
             if should_stop and should_stop():
                 raise _StreamInterrupted
             content, tool_calls = self._stream_completion(
                 messages,
                 tools,
                 completion_kwargs,
+                first_round=round_index == 0,
                 on_delta=on_delta,
                 on_reasoning=on_reasoning,
                 on_revoke=on_revoke,
@@ -248,17 +309,14 @@ class LLMClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         completion_kwargs: dict[str, Any],
+        first_round: bool,
         on_delta: Callable[[str], None] | None,
         on_reasoning: Callable[[str], None] | None,
         on_revoke: Callable[[], None] | None,
         should_stop: Callable[[], bool] | None,
     ) -> tuple[str, list[dict[str, str]] | None]:
-        stream = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            tools=tools if tools else None,
-            stream=True,
-            **completion_kwargs,
+        stream = self._create(
+            messages, tools, completion_kwargs, first_round=first_round, stream=True
         )
         content_parts: list[str] = []
         reasoning_parts: list[str] = []

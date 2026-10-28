@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from ui.chrome import RoundedCard, ThemedMenu
 from ui.icons import bind_editor_menu, icon_copy
+from ui.markdown_render import code_blocks, render_markdown
 from ui.theme import COLOR_ACCENT, COLOR_BORDER, COLOR_SURFACE, COLOR_USER_BUBBLE
 
 _Radii = tuple[float, float, float, float]
@@ -219,16 +220,24 @@ class _MessageRow(QWidget):
             margins = (16, 11, 14, 11)
         inner = QVBoxLayout(bubble)
         inner.setContentsMargins(*margins)
-        body = QLabel(text)
+        body = QLabel()
         body.setObjectName("bubbleText")
         body.setWordWrap(True)
-        body.setTextFormat(Qt.TextFormat.PlainText)
-        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        if role == "assistant":
+            body.setTextFormat(Qt.TextFormat.RichText)
+            body.setOpenExternalLinks(True)
+            body.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
+            )
+        else:
+            body.setTextFormat(Qt.TextFormat.PlainText)
+            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         body.setMinimumHeight(18)
         inner.addWidget(body)
         self._body = body
         self._bubble = bubble
+        self._show(text)
 
         role_label = QLabel("你" if role == "user" else "助教")
         role_label.setObjectName("bubbleRole")
@@ -253,7 +262,10 @@ class _MessageRow(QWidget):
 
     def set_text(self, text: str) -> None:
         self._text = text
-        self._body.setText(text)
+        self._show(text)
+
+    def _show(self, text: str) -> None:
+        self._body.setText(render_markdown(text) if self._role == "assistant" else text)
 
     def set_max_width(self, width: int) -> None:
         if self._bubble is None:
@@ -267,6 +279,12 @@ class _MessageRow(QWidget):
         menu = ThemedMenu(self)
         copy_action = menu.addAction(icon_copy(), "复制")
         copy_action.triggered.connect(self._copy)
+        snippets = code_blocks(self._text) if self._role == "assistant" else []
+        if snippets:
+            code_action = menu.addAction(icon_copy(), "复制代码")
+            code_action.triggered.connect(
+                lambda: QGuiApplication.clipboard().setText("\n\n".join(snippets))
+            )
         extra = self._extras()
         if extra:
             menu.addSeparator()

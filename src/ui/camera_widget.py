@@ -40,6 +40,9 @@ class CameraWidget(QLabel):
         self._flush_scheduled = False
         self._pixmap_size = (0, 0)
 
+    def latest_frame(self) -> np.ndarray | None:
+        return self._latest
+
     def show_frame(self, frame_bgr: np.ndarray) -> None:
         self._latest = frame_bgr
         if self._flush_scheduled:

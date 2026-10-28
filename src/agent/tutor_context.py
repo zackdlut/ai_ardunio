@@ -9,6 +9,7 @@ def build_extra_system(
     verify_msg: str,
     scene_summary: dict[str, Any],
     voice_mode: bool,
+    has_image: bool = False,
 ) -> str:
     summary = scene_summary.get("summary", {})
     parts = [
@@ -27,6 +28,13 @@ def build_extra_system(
             + json.dumps(marks, ensure_ascii=False)
         )
         parts.append("学生若问起「这里」或某个标记，就按这些坐标和最近的器件回答。")
+    if has_image:
+        parts.append(
+            "学生这条消息附了一张当前摄像头画面。画面上的角框、器件名、引脚高亮、"
+            "箭头、顶部提示条和「标记 N」都是程序叠加的，不是实物。"
+            "判断接线、极性、插孔位置时以图片为准；检测框可能漏检或误检，"
+            "与视觉摘要冲突时说明你看到的情况。看不清就直说并请学生调整镜头，不要猜。"
+        )
     if voice_mode:
         parts.append(
             "学生正在用语音和你面对面交流。请只输出要说出口的话："
