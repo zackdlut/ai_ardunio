@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QRegion
-from PySide6.QtWidgets import QFrame, QMenu, QProxyStyle, QStyle, QStyleOptionMenuItem
+from PySide6.QtWidgets import QFrame, QLabel, QMenu, QProxyStyle, QStyle, QStyleOptionMenuItem, QWidgetAction
 
 from ui.theme import COLOR_ACCENT, COLOR_ACCENT_SOFT, COLOR_BORDER, COLOR_SURFACE, COLOR_TEXT, COLOR_TEXT_MUTED
 
@@ -139,6 +139,18 @@ class ThemedMenu(QMenu):
         self.setFont(font)
         self.setStyle(_menu_gap_style())
         self.setObjectName("appMenu")
+
+    def add_section(self, text: str) -> QWidgetAction:
+        """Small muted heading over a group of items; not hoverable or clickable."""
+        if self.actions():
+            self.addSeparator()
+        label = QLabel(text)
+        label.setObjectName("menuSection")
+        action = QWidgetAction(self)
+        action.setDefaultWidget(label)
+        action.setEnabled(False)
+        self.addAction(action)
+        return action
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)

@@ -51,6 +51,7 @@ from ui.camera_devices import list_cameras
 from ui.camera_worker import CameraWorker
 from ui.camera_widget import CameraWidget
 from ui.chat_widget import ChatWidget
+from ui.sidebar_controls import style_sidebar_primary
 from ui.chrome import RoundedCard, ThemedMenu
 from ui.repair_panel import STATUS_TEXT, RepairPanel
 from ui.settings_dialog import CHAT_KEYS, REPAIR_KEYS, SettingsDialog
@@ -65,12 +66,10 @@ from ui.icons import (
     icon_project,
     icon_refresh,
     icon_remote,
-    icon_repair,
     icon_settings,
     icon_speaker,
     icon_stop,
     icon_upload,
-    icon_view,
     icon_voice,
     with_label_gap,
 )
@@ -483,7 +482,7 @@ class MainWindow(QMainWindow):
         self._step_title.setObjectName("stepTitle")
         self._step_title.setWordWrap(True)
         self._advance_btn = QPushButton("下一步")
-        self._advance_btn.setObjectName("primaryButton")
+        style_sidebar_primary(self._advance_btn)
         self._advance_btn.setToolTip("手动进入下一教学步骤")
         self._advance_btn.clicked.connect(self._advance_step)
         title_row.addWidget(self._step_title, stretch=1)
@@ -517,6 +516,10 @@ class MainWindow(QMainWindow):
         self._chat = ChatWidget(model_name=self._settings.openai_model)
         self._chat.send_requested.connect(lambda t: self._on_chat(t, voice_mode=False))
         self._chat.voice_session_toggled.connect(self._on_voice_toggled)
+        self._chat.mode_change_requested.connect(self._set_mode)
+        extra = self._settings.llm_extra_body_dict()
+        self._chat.set_thinking_enabled(extra.get("enable_thinking") is not False)
+        self._chat.set_mode(self._mode)
         self._chat.set_context_actions(
             [self._clear_action, self._tts_action, self._stop_tts_action]
         )
@@ -526,7 +529,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(sidebar)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        splitter.setSizes([860, 400])
+        splitter.setSizes([840, 420])
         layout.addWidget(splitter, stretch=1)
 
     def _build_top_bar(self) -> QWidget:
@@ -553,23 +556,27 @@ class MainWindow(QMainWindow):
         row.addWidget(self._port_chip)
         row.addStretch(1)
 
-        for text, menu, icon in (
-            ("模式", self._mode_menu, icon_repair()),
-            ("项目", self._project_menu, icon_project()),
-            ("硬件", self._hardware_menu, icon_hardware()),
-            ("摄像头", self._camera_menu, icon_camera()),
-            ("语音", self._voice_menu, icon_voice()),
-            ("视图", self._view_menu, icon_view()),
-        ):
-            button = QToolButton()
-            button.setObjectName("toolbarButton")
-            button.setText(f"{text}  ▾")
-            button.setIcon(with_label_gap(icon, 8))
-            button.setIconSize(QSize(24, 16))
-            button.setMenu(menu)
-            button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-            row.addWidget(button)
+        groups = (
+            (("对话", self._chat_menu, icon_project(), "教学步骤与对话记忆"),),
+            (
+                ("开发板", self._hardware_menu, icon_hardware(), "串口、烧录与烧录日志"),
+                ("摄像头", self._camera_menu, icon_camera(), "选择摄像头，暂停识别或清除标记"),
+                ("语音", self._voice_menu, icon_voice(), "朗读回复与语音识别引擎"),
+            ),
+        )
+        for group in groups:
+            for text, menu, icon, tip in group:
+                button = QToolButton()
+                button.setObjectName("toolbarButton")
+                button.setText(f"{text}  ▾")
+                button.setToolTip(tip)
+                button.setIcon(with_label_gap(icon, 8))
+                button.setIconSize(QSize(24, 16))
+                button.setMenu(menu)
+                button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+                row.addWidget(button)
+            row.addWidget(self._toolbar_divider())
 
         settings_btn = QToolButton()
         settings_btn.setObjectName("toolbarButton")
@@ -581,6 +588,14 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_settings)
         row.addWidget(settings_btn)
         return bar
+
+    @staticmethod
+    def _toolbar_divider() -> QFrame:
+        line = QFrame()
+        line.setObjectName("toolbarDivider")
+        line.setFrameShape(QFrame.Shape.NoFrame)
+        line.setFixedSize(1, 18)
+        return line
 
     def _show_camera_menu(self, pos) -> None:
         self._camera_menu.exec(self._camera_widget.mapToGlobal(pos))
@@ -595,82 +610,60 @@ class MainWindow(QMainWindow):
 
         self.menuBar().hide()
 
-        mode_menu = ThemedMenu(self)
-        mode_menu.setObjectName("appMenu")
-        self._mode_group = QActionGroup(self)
-        self._mode_group.setExclusive(True)
-        self._mode_actions: dict[str, QAction] = {}
-        for mode, icon, label, tip in (
-            ("tutor", icon_project(), "教学模式", "跟着步骤搭建 Arduino 实验"),
-            ("repair", icon_repair(), "维修模式", "诊断电路板或设备故障，在画面上标出检查点"),
-        ):
-            action = mode_menu.addAction(icon, label)
-            action.setCheckable(True)
-            action.setData(mode)
-            action.setToolTip(tip)
-            self._mode_group.addAction(action)
-            self._mode_actions[mode] = action
-        self._mode_actions["tutor"].setChecked(True)
-        self._mode_group.triggered.connect(lambda action: self._set_mode(str(action.data())))
-        self._mode_menu = mode_menu
-
-        project = ThemedMenu(self)
-        project.setObjectName("appMenu")
-        next_action = project.addAction(icon_next(), "下一步")
-        next_action.setToolTip("手动进入下一教学步骤")
-        next_action.triggered.connect(self._advance_step)
-        self._clear_action = project.addAction(icon_clear(), "清空对话")
+        chat = ThemedMenu(self)
+        self._next_action = chat.addAction(icon_next(), "下一步")
+        self._next_action.setToolTip("手动进入下一教学步骤")
+        self._next_action.triggered.connect(self._advance_step)
+        self._clear_action = chat.addAction(icon_clear(), "清空对话")
         self._clear_action.setToolTip("清除与助手的多轮记忆")
         self._clear_action.triggered.connect(self._clear_dialog)
-        self._project_menu = project
-
-        view = ThemedMenu(self)
-        view.setObjectName("appMenu")
-        self._show_log_action = view.addAction(icon_log(), "编译与烧录")
-        self._show_log_action.setCheckable(True)
-        self._show_log_action.setChecked(False)
-        self._show_log_action.setToolTip("显示或隐藏编译与烧录日志")
-        self._show_log_action.toggled.connect(self._set_log_visible)
-        self._pause_action = view.addAction(icon_stop(), "暂停识别")
-        self._pause_action.setCheckable(True)
-        self._pause_action.setToolTip("暂停器件识别，画面继续显示。竖起拇指可继续。")
-        self._pause_action.toggled.connect(self._set_vision_paused)
-        self._clear_marks_action = view.addAction(icon_clear(), "清除画面标记")
-        self._clear_marks_action.setToolTip("去掉你在画面上点出、框出或圈出的标记")
-        self._clear_marks_action.triggered.connect(self._clear_marks)
-        self._view_menu = view
+        self._chat_menu = chat
 
         self._hardware_menu = ThemedMenu(self)
-        self._hardware_menu.setObjectName("appMenu")
+        self._hardware_menu.add_section("端口")
+        self._port_insert_before = self._hardware_menu.addSeparator()
         refresh_boards = self._hardware_menu.addAction(icon_refresh(), "刷新开发板")
         refresh_boards.setToolTip("重新扫描已连接的 Arduino 开发板")
         refresh_boards.triggered.connect(self._refresh_boards)
-        self._hardware_menu.addSeparator()
-        self._port_insert_before = self._hardware_menu.addSeparator()
+        self._hardware_menu.add_section("烧录")
         upload_action = self._hardware_menu.addAction(icon_upload(), "烧录 Blink")
         upload_action.setToolTip("编译并上传 Blink 示例到所选串口")
         upload_action.triggered.connect(self._upload_blink)
+        self._show_log_action = self._hardware_menu.addAction(icon_log(), "显示烧录日志")
+        self._show_log_action.setCheckable(True)
+        self._show_log_action.setChecked(False)
+        self._show_log_action.setToolTip("在画面下方显示或隐藏编译与烧录日志")
+        self._show_log_action.toggled.connect(self._set_log_visible)
         self._port_group = QActionGroup(self)
         self._port_group.setExclusive(True)
 
         self._camera_menu = ThemedMenu(self)
-        self._camera_menu.setObjectName("appMenu")
-        refresh_cameras = self._camera_menu.addAction(icon_refresh(), "刷新")
-        refresh_cameras.setToolTip("重新扫描本机摄像头")
-        refresh_cameras.triggered.connect(self._refresh_cameras)
-        self._camera_menu.addSeparator()
+        self._camera_menu.add_section("摄像头")
         self._camera_group = QActionGroup(self)
         self._camera_group.setExclusive(True)
         self._camera_group.triggered.connect(self._on_camera_changed)
         self._camera_insert_before = self._camera_menu.addSeparator()
-        pause_cam = self._camera_menu.addAction(icon_stop(), "暂停 / 继续识别")
-        pause_cam.setToolTip("暂停后画面还在，竖起拇指也会继续")
-        pause_cam.triggered.connect(lambda: self._set_vision_paused(not self._vision_paused))
-        clear_cam = self._camera_menu.addAction(icon_clear(), "清除画面标记")
-        clear_cam.triggered.connect(self._clear_marks)
+        refresh_cameras = self._camera_menu.addAction(icon_refresh(), "刷新摄像头")
+        refresh_cameras.setToolTip("重新扫描本机摄像头")
+        refresh_cameras.triggered.connect(self._refresh_cameras)
+        self._camera_menu.add_section("识别")
+        self._pause_action = self._camera_menu.addAction(icon_stop(), "暂停识别")
+        self._pause_action.setCheckable(True)
+        self._pause_action.setToolTip("暂停器件识别，画面继续显示。竖起拇指可继续。")
+        self._pause_action.toggled.connect(self._set_vision_paused)
+        self._clear_marks_action = self._camera_menu.addAction(icon_clear(), "清除画面标记")
+        self._clear_marks_action.setToolTip("去掉你在画面上点出、框出或圈出的标记")
+        self._clear_marks_action.triggered.connect(self._clear_marks)
 
         voice = ThemedMenu(self)
-        voice.setObjectName("appMenu")
+        voice.add_section("朗读")
+        self._tts_action = voice.addAction(icon_speaker(), "语音回复")
+        self._tts_action.setCheckable(True)
+        self._tts_action.setChecked(self._settings.tts_enabled)
+        self._tts_action.setToolTip("文字提问后朗读回复。语音辅导会话中总会朗读。")
+        self._stop_tts_action = voice.addAction(icon_stop(), "停止朗读")
+        self._stop_tts_action.triggered.connect(self._tts.stop)
+        voice.add_section("语音识别")
         self._asr_group = QActionGroup(self)
         self._asr_group.setExclusive(True)
         self._asr_actions: dict[str, QAction] = {}
@@ -687,13 +680,6 @@ class MainWindow(QMainWindow):
         self._asr_actions[self._settings.asr_backend].setChecked(True)
         self._refresh_asr_tooltips()
         self._asr_group.triggered.connect(self._on_asr_mode_changed)
-        voice.addSeparator()
-        self._tts_action = voice.addAction(icon_speaker(), "语音回复")
-        self._tts_action.setCheckable(True)
-        self._tts_action.setChecked(self._settings.tts_enabled)
-        self._tts_action.setToolTip("文字提问后朗读回复。语音辅导会话中总会朗读。")
-        self._stop_tts_action = voice.addAction(icon_stop(), "停止朗读")
-        self._stop_tts_action.triggered.connect(self._tts.stop)
         self._voice_menu = voice
 
     def _set_log_visible(self, visible: bool) -> None:
@@ -835,7 +821,7 @@ class MainWindow(QMainWindow):
             self._pause_action.setChecked(paused)
             self._pause_action.blockSignals(False)
         if paused:
-            self._chat.append_system("识别已暂停。竖起拇指，或在「视图」里再点一次即可继续。")
+            self._chat.append_system("识别已暂停。竖起拇指，或在「摄像头」菜单里再点一次即可继续。")
         else:
             self._chat.append_system("已继续识别画面")
 
@@ -1000,6 +986,8 @@ class MainWindow(QMainWindow):
             self._on_asr_mode_changed()
         if dialog.changed & CHAT_KEYS:
             self._chat.set_model_name(self._settings.openai_model)
+            extra = self._settings.llm_extra_body_dict()
+            self._chat.set_thinking_enabled(extra.get("enable_thinking") is not False)
             self._chat.append_system(f"正在连接对话模型 {self._settings.openai_model}…")
             self._start_llm_connect()
         if dialog.changed & REPAIR_KEYS:
@@ -1410,7 +1398,7 @@ class MainWindow(QMainWindow):
             max_rounds=10 if repair else 6,
             drain_images=self._repair.drain_images if repair else None,
             keep_preface=repair and not voice_mode,
-            options=self._repair_llm_options(voice_mode, frame is not None) if repair else None,
+            options=self._llm_options(repair, voice_mode, frame is not None),
         )
         _keep_alive(self._llm_worker)
         self._llm_worker.delta.connect(self._on_llm_delta)
@@ -1418,23 +1406,35 @@ class MainWindow(QMainWindow):
         self._llm_worker.revoke.connect(self._on_llm_revoke)
         self._llm_worker.succeeded.connect(self._on_llm_reply)
         self._llm_worker.failed.connect(self._on_llm_failed)
-        self._chat.begin_thinking()
+        if self._chat.thinking_enabled():
+            self._chat.begin_thinking()
         self._llm_worker.start()
 
-    def _repair_llm_options(self, voice_mode: bool, has_image: bool) -> dict:
-        ctx = self._repair
+    def _llm_options(self, repair: bool, voice_mode: bool, has_image: bool) -> dict:
+        options: dict = {}
+        if repair:
+            ctx = self._repair
 
-        def follow_up(reply: str) -> str | None:
-            if not needs_drawing(reply, has_image, ctx.drew_this_turn):
-                return None
-            if ctx.debug is not None:
-                ctx.debug.note(nudged=True)
-            return NUDGE_TEXT
+            def follow_up(reply: str) -> str | None:
+                if not needs_drawing(reply, has_image, ctx.drew_this_turn):
+                    return None
+                if ctx.debug is not None:
+                    ctx.debug.note(nudged=True)
+                return NUDGE_TEXT
 
-        # Voice repair turns still have to call drawing tools, so no small token cap.
-        options: dict = {"voice_max_tokens": None, "follow_up": follow_up}
-        if voice_mode and not self._settings.repair_voice_think:
-            options["extra_body"] = {"reasoning_effort": "none"}
+            options["voice_max_tokens"] = None
+            options["follow_up"] = follow_up
+
+        extra: dict = dict(options.get("extra_body") or {})
+        if self._chat.thinking_enabled():
+            if self._settings.llm_extra_body_dict().get("enable_thinking") is False:
+                extra["enable_thinking"] = True
+                extra.pop("reasoning_effort", None)
+        else:
+            extra["enable_thinking"] = False
+            extra["reasoning_effort"] = "none"
+        if extra:
+            options["extra_body"] = extra
         return options
 
     @Slot(int, str)
@@ -1611,9 +1611,9 @@ class MainWindow(QMainWindow):
             self._cancel_inflight()
             self._chat.end_assistant_stream()
         self._mode = mode
-        if not self._mode_actions[mode].isChecked():
-            self._mode_actions[mode].setChecked(True)
+        self._chat.set_mode(mode)
         repair = mode == "repair"
+        self._next_action.setVisible(not repair)
         self._show_mode_page(1 if repair else 0)
         self._camera.set_mode(mode)
         self._dialog_history.clear()

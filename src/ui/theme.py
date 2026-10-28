@@ -13,6 +13,7 @@ COLOR_SURFACE = "#FFFFFF"
 COLOR_BORDER = "#E3EAE6"
 COLOR_TEXT = "#1B2A22"
 COLOR_TEXT_MUTED = "#8B9892"
+COLOR_TEXT_FAINT = "#A3AFA9"
 COLOR_ACCENT = "#1B9A6A"
 COLOR_ACCENT_HOVER = "#15885C"
 COLOR_ACCENT_SOFT = "#E7F6EF"
@@ -31,6 +32,8 @@ FONT_MONO_FAMILIES = ["Cascadia Mono", "Consolas"]
 
 
 def app_stylesheet() -> str:
+    # Must stay a single selector: it is prefixed onto descendant rules below.
+    sidebar = "QWidget#sidePanel"
     return f"""
     QWidget {{
         color: {COLOR_TEXT};
@@ -88,6 +91,19 @@ def app_stylesheet() -> str:
     QToolButton#toolbarButton:open {{
         background: {COLOR_SURFACE};
         border-color: {COLOR_BORDER};
+    }}
+
+    QLabel#menuSection {{
+        color: {COLOR_TEXT_MUTED};
+        font-size: 11px;
+        font-weight: 600;
+        padding: 6px 14px 2px 14px;
+        background: transparent;
+    }}
+
+    QFrame#toolbarDivider {{
+        background-color: {COLOR_BORDER};
+        border: none;
     }}
 
     QToolButton#toolbarButton::menu-indicator {{
@@ -241,15 +257,23 @@ def app_stylesheet() -> str:
         border: none;
     }}
 
-    QScrollArea#chatScroll {{
+    QScrollArea#chatScroll,
+    QScrollArea#chatScroll QWidget#qt_scrollarea_viewport,
+    QWidget#chatTranscript {{
         background: transparent;
         border: none;
     }}
 
-    QLabel#bubbleRole {{
-        color: {COLOR_TEXT_MUTED};
+    QLabel#speakerName {{
+        color: {COLOR_ACCENT_INK};
+        font-size: 12px;
+        font-weight: 700;
+    }}
+
+    QLabel#speakerTime {{
+        color: {COLOR_TEXT_FAINT};
+        font-family: {FONT_MONO};
         font-size: 11px;
-        background: transparent;
     }}
 
     QLabel#bubbleText {{
@@ -258,52 +282,62 @@ def app_stylesheet() -> str:
         background: transparent;
     }}
 
-    QPushButton#thinkToggle {{
+    QPushButton#thinkToggle,
+    QPushButton#logToggle {{
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 6px;
+        border-radius: 5px;
         color: {COLOR_TEXT_MUTED};
         font-size: 12px;
-        font-weight: 600;
+        font-weight: 500;
         text-align: left;
-        padding: 2px 6px;
+        padding: 1px 6px 1px 2px;
     }}
 
-    QPushButton#thinkToggle:hover {{
-        background: {COLOR_ACCENT_SOFT};
-        border-color: transparent;
+    QPushButton#logToggle {{
+        color: {COLOR_TEXT_FAINT};
+        font-size: 11px;
+    }}
+
+    QPushButton#thinkToggle:hover,
+    QPushButton#logToggle:hover {{
         color: {COLOR_ACCENT_INK};
     }}
 
-    QPushButton#thinkToggle:focus {{
-        border: 1px solid {COLOR_ACCENT};
-        background: transparent;
+    QPushButton#thinkToggle:focus,
+    QPushButton#logToggle:focus {{
+        border-color: {COLOR_ACCENT};
     }}
 
     QLabel#thinkBody {{
         color: {COLOR_THINK};
         font-size: 12px;
         background: transparent;
-        padding: 1px 2px 2px 10px;
-        margin-left: 8px;
-        border-left: 2px solid {COLOR_ACCENT};
+        padding: 0 0 0 10px;
+        margin-left: 3px;
+        border-left: 2px solid {COLOR_TRACK_EMPTY};
     }}
 
-    QLabel#systemDot {{
-        color: {COLOR_ACCENT};
-        font-size: 9px;
-        background: transparent;
+    QLabel#logTime {{
+        color: {COLOR_TEXT_FAINT};
+        font-family: {FONT_MONO};
+        font-size: 11px;
+        padding-top: 1px;
     }}
 
-    QLabel#systemText {{
+    QLabel#logText {{
         color: {COLOR_TEXT_MUTED};
         font-size: 12px;
-        background: transparent;
+    }}
+
+    QLabel#logText[alert="true"] {{
+        color: {COLOR_FAULT};
     }}
 
     QLabel#chatPlaceholder {{
         color: {COLOR_TEXT_MUTED};
-        font-size: 13px;
+        font-size: 12px;
+        padding: 28px 24px;
         background: transparent;
     }}
 
@@ -320,6 +354,133 @@ def app_stylesheet() -> str:
     QLabel#modelLabel {{
         color: {COLOR_TEXT_MUTED};
         font-size: 12px;
+    }}
+
+    QWidget#chatSidebar QLabel#modelLabel {{
+        font-size: 11px;
+        font-weight: 500;
+        padding: 0 2px;
+    }}
+
+    QWidget#chatSidebar QLabel#voiceStatus {{
+        color: {COLOR_ACCENT_INK};
+        font-size: 11px;
+        font-weight: 600;
+        padding: 0 4px;
+    }}
+
+    {sidebar} QPushButton#chatControl,
+    {sidebar} QToolButton#chatControl {{
+        background-color: #F4F8F6;
+        border: 1px solid {COLOR_BORDER};
+        border-radius: 14px;
+        padding: 0 10px;
+        min-height: 28px;
+        max-height: 28px;
+        color: {COLOR_TEXT};
+        font-size: 12px;
+        font-weight: 600;
+    }}
+
+    {sidebar} QToolButton#chatControl {{
+        padding: 0 8px 0 6px;
+    }}
+
+    {sidebar} QPushButton#chatControl:hover,
+    {sidebar} QToolButton#chatControl:hover {{
+        background-color: #FAFCFB;
+        border-color: #C9D5CE;
+    }}
+
+    {sidebar} QPushButton#chatControl:pressed,
+    {sidebar} QToolButton#chatControl:pressed {{
+        background-color: #E7EEEA;
+    }}
+
+    {sidebar} QPushButton#chatControl:focus,
+    {sidebar} QToolButton#chatControl:focus {{
+        border-color: {COLOR_ACCENT};
+    }}
+
+    {sidebar} QToolButton#chatControl::menu-indicator {{
+        image: none;
+        width: 0;
+    }}
+
+    {sidebar} QPushButton#chatControl:checked {{
+        background-color: {COLOR_ACCENT_SOFT};
+        border-color: {COLOR_ACCENT};
+        color: {COLOR_ACCENT_INK};
+    }}
+
+    {sidebar} QPushButton#chatControl:disabled,
+    {sidebar} QToolButton#chatControl:disabled {{
+        color: #B5C0BA;
+        border-color: #E8EEEA;
+        background-color: #F7FAF8;
+    }}
+
+    {sidebar} QPushButton#sidebarPrimary {{
+        background-color: {COLOR_ACCENT};
+        border: 1px solid {COLOR_ACCENT};
+        color: #FFFFFF;
+        font-weight: 600;
+        font-size: 12px;
+        border-radius: 14px;
+        padding: 0 12px;
+        min-height: 28px;
+        max-height: 28px;
+    }}
+
+    {sidebar} QPushButton#sidebarPrimary:hover {{
+        background-color: {COLOR_ACCENT_HOVER};
+        border-color: {COLOR_ACCENT_HOVER};
+    }}
+
+    {sidebar} QPushButton#sidebarPrimary:pressed {{
+        background-color: #0F6E48;
+        border-color: #0F6E48;
+    }}
+
+    {sidebar} QPushButton#sidebarPrimary:focus {{
+        border: 2px solid {COLOR_ACCENT_SOFT};
+    }}
+
+    {sidebar} QPushButton#sidebarPrimary:disabled {{
+        background-color: #8ACFAF;
+        border-color: #8ACFAF;
+        color: #FFFFFF;
+    }}
+
+    QWidget#chatSidebar QPushButton#chatSend {{
+        background-color: {COLOR_ACCENT};
+        border: none;
+        border-radius: 14px;
+        min-width: 28px;
+        max-width: 28px;
+        min-height: 28px;
+        max-height: 28px;
+        padding: 0;
+        color: #FFFFFF;
+        font-size: 15px;
+        font-weight: 700;
+    }}
+
+    QWidget#chatSidebar QPushButton#chatSend:hover {{
+        background-color: {COLOR_ACCENT_HOVER};
+    }}
+
+    QWidget#chatSidebar QPushButton#chatSend:pressed {{
+        background-color: #0F6E48;
+    }}
+
+    QWidget#chatSidebar QPushButton#chatSend:focus {{
+        border: 2px solid {COLOR_ACCENT_SOFT};
+    }}
+
+    QWidget#chatSidebar QPushButton#chatSend:disabled {{
+        background-color: {COLOR_TRACK_EMPTY};
+        color: #FFFFFF;
     }}
 
     QPushButton {{
@@ -363,64 +524,16 @@ def app_stylesheet() -> str:
         border-color: #0F6E48;
     }}
 
-    QPushButton#sendButton {{
-        background-color: {COLOR_ACCENT};
-        border: none;
-        color: #FFFFFF;
-        border-radius: 16px;
-        min-width: 32px;
-        max-width: 32px;
-        min-height: 32px;
-        max-height: 32px;
-        padding: 0;
-        font-size: 16px;
-        font-weight: 700;
-    }}
-
-    QPushButton#sendButton:hover {{
-        background-color: {COLOR_ACCENT_HOVER};
-    }}
-
-    QPushButton#sendButton:pressed {{
-        background-color: #0F6E48;
-    }}
-
-    QPushButton#voiceButton {{
-        background: transparent;
-        border: 1px solid {COLOR_BORDER};
-        border-radius: 14px;
-        padding: 4px 10px;
-        color: {COLOR_TEXT};
-        font-weight: 500;
-    }}
-
-    QPushButton#voiceButton:hover {{
-        background: #F7FAF8;
-    }}
-
-    QPushButton:disabled,
-    QPushButton#voiceButton:disabled {{
-        color: #B5C0BA;
-        border-color: #E8EEEA;
-        background: transparent;
-    }}
-
     QPushButton#primaryButton:disabled {{
         background-color: #8ACFAF;
         border-color: #8ACFAF;
         color: #FFFFFF;
     }}
 
-    QPushButton#voiceButton:checked {{
-        background-color: {COLOR_ACCENT_SOFT};
-        border-color: {COLOR_ACCENT};
-        color: {COLOR_ACCENT_INK};
-    }}
-
-    QLabel#voiceStatus {{
-        color: {COLOR_ACCENT_INK};
-        font-size: 12px;
-        background: transparent;
+    QPushButton:disabled {{
+        color: #B5C0BA;
+        border-color: #E8EEEA;
+        background-color: #F7FAF8;
     }}
 
     QListWidget#checkList {{

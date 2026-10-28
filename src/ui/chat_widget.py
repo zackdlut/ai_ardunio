@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPalette, QPen
+import re
+import time
+from collections.abc import Callable
+from datetime import datetime
+
+from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, Signal, QSize
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -10,23 +15,25 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ui.chrome import RailCard, RoundedCard, ThemedMenu
-from ui.icons import bind_editor_menu, icon_copy
+from ui.icons import bind_editor_menu, icon_copy, icon_project, icon_repair, with_label_gap
+from ui.sidebar_controls import style_sidebar_chip
 from ui.markdown_render import code_blocks, render_markdown
 from ui.theme import (
     COLOR_ACCENT,
     COLOR_ACCENT_INK,
-    COLOR_BORDER,
     COLOR_CAUTION,
     COLOR_CAUTION_SOFT,
     COLOR_FAULT,
     COLOR_FAULT_SOFT,
     COLOR_SURFACE,
     COLOR_TEXT_MUTED,
+    COLOR_TRACK_EMPTY,
     COLOR_USER_BUBBLE,
 )
 
@@ -39,8 +46,29 @@ EVENT_TONES = {
     "info": ("#B7C4BC", COLOR_SURFACE, COLOR_TEXT_MUTED),
 }
 _STAMP_SPACE = 76
+_MARK_SIZE = 18
+_USER_SHARE = 0.85
+_LOG_INSET = 12
+_LOG_GUTTER = 46
+_TURN_GAP = 10
+_LOG_ALERT = re.compile(r"失败|警告|错误|不可用|未检测到")
+_LONG_RUN = re.compile(r"\S{24,}")
+_SOFT_BREAK = re.compile(r"([\\/_.:@?&=])")
+_EMPTY_HINTS = {
+    "tutor": "跟着当前步骤动手，卡住了就在下面问我",
+    "repair": "先说说故障现象，或者把板子对准摄像头",
+}
 
 _Radii = tuple[float, float, float, float]
+
+
+def _clock() -> str:
+    return datetime.now().strftime("%H:%M")
+
+
+def _soft_wrap(text: str) -> str:
+    """Let long paths and URLs break after separators instead of widening the transcript."""
+    return _LONG_RUN.sub(lambda run: _SOFT_BREAK.sub(lambda m: m.group(1) + "\u200b", run.group(0)), text)
 
 
 def _clamp_radii(rect: QRectF, radii: _Radii) -> _Radii:
@@ -88,18 +116,10 @@ def _round_path(rect: QRectF, radii: _Radii) -> QPainterPath:
 
 
 class _Bubble(QFrame):
-    def __init__(
-        self,
-        fill: str,
-        border: str | None,
-        radii: _Radii,
-        rail: bool = False,
-    ) -> None:
+    def __init__(self, fill: str, radii: _Radii) -> None:
         super().__init__()
         self._fill = QColor(fill)
-        self._border = QColor(border) if border else None
         self._radii = radii
-        self._rail = rail
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.setAutoFillBackground(False)
 
@@ -108,36 +128,74 @@ class _Bubble(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        path = _round_path(rect, self._radii)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(self._fill)
-        painter.drawPath(path)
-        if self._rail:
-            painter.setClipPath(path)
-            painter.fillRect(QRectF(rect.left(), rect.top(), 3.0, rect.height()), QColor(COLOR_ACCENT))
-            painter.setClipping(False)
-        if self._border is not None:
-            painter.setPen(QPen(self._border))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPath(path)
+        painter.drawPath(_round_path(rect, self._radii))
+
+
+class _SpeakerMark(QWidget):
+    """Small green square carrying the first character of the assistant's name, like the app mark."""
+
+    def __init__(self, glyph: str) -> None:
+        super().__init__()
+        self._glyph = glyph[:1]
+        self.setFixedSize(_MARK_SIZE, _MARK_SIZE)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(COLOR_ACCENT))
+        painter.drawRoundedRect(rect, 5, 5)
+        font = self.font()
+        font.setPixelSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), self._glyph)
+        painter.end()
+
+
+class _Speaker(QWidget):
+    """Who is talking and since when; shown once at the top of an assistant turn."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        label = QLabel(name)
+        label.setObjectName("speakerName")
+        stamp = QLabel(_clock())
+        stamp.setObjectName("speakerTime")
+        row.addWidget(_SpeakerMark(name), alignment=Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(stamp, alignment=Qt.AlignmentFlag.AlignVCenter)
+        row.addStretch(1)
 
 
 class _ThinkingNote(QWidget):
-    """Scratchpad that stays open while tokens arrive, then folds to one line."""
+    """Scratchpad that stays open while tokens arrive, then folds to one line with its duration."""
 
-    def __init__(self) -> None:
+    assistant_side = True
+
+    def __init__(self, speaker: str) -> None:
         super().__init__()
         self._text = ""
         self._live = True
         self._expanded = True
+        self._started = time.monotonic()
+        self._elapsed = 0.0
         self.setAutoFillBackground(False)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 8, 2)
+        self._layout = layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, _TURN_GAP, 0, 0)
         layout.setSpacing(4)
-        self._toggle = QPushButton("▾  思考中")
+        self._speaker = _Speaker(speaker)
+        self._toggle = QPushButton()
         self._toggle.setObjectName("thinkToggle")
         self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._toggle.setFlat(True)
         self._toggle.setAutoDefault(False)
         self._toggle.setDefault(False)
         self._toggle.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -149,8 +207,13 @@ class _ThinkingNote(QWidget):
         self._body.setTextFormat(Qt.TextFormat.PlainText)
         self._body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._body.setVisible(False)
+        layout.addWidget(self._speaker)
         layout.addWidget(self._toggle, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self._body)
+        self._ticker = QTimer(self)
+        self._ticker.setInterval(1000)
+        self._ticker.timeout.connect(self._sync_label)
+        self._ticker.start()
         self._sync_label()
 
     def text(self) -> str:
@@ -159,18 +222,21 @@ class _ThinkingNote(QWidget):
     def is_live(self) -> bool:
         return self._live
 
+    def set_speaker_visible(self, visible: bool) -> None:
+        self._speaker.setVisible(visible)
+        self._layout.setContentsMargins(0, _TURN_GAP if visible else 0, 0, 0)
+
     def append_text(self, piece: str) -> None:
         self._text += piece
         self._body.setText(self._text)
-        self._live = True
-        self._expanded = True
-        self._body.setVisible(True)
-        self._sync_label()
+        self.mark_live()
 
     def mark_live(self) -> None:
         self._live = True
         self._expanded = True
         self._body.setVisible(bool(self._text))
+        if not self._ticker.isActive():
+            self._ticker.start()
         self._sync_label()
 
     def mark_done(self) -> None:
@@ -178,13 +244,13 @@ class _ThinkingNote(QWidget):
             return
         self._live = False
         self._expanded = False
+        self._elapsed = time.monotonic() - self._started
+        self._ticker.stop()
         self._body.setVisible(False)
         self._sync_label()
 
     def set_max_width(self, width: int) -> None:
-        capped = max(160, width)
-        self.setMaximumWidth(capped)
-        self._body.setMaximumWidth(max(120, capped - 28))
+        self._body.setMaximumWidth(max(120, width))
 
     def _on_toggle(self) -> None:
         if self._live:
@@ -193,17 +259,18 @@ class _ThinkingNote(QWidget):
         self._body.setVisible(self._expanded and bool(self._text.strip()))
         self._sync_label()
 
+    def _seconds(self) -> int:
+        spent = self._elapsed if not self._live else time.monotonic() - self._started
+        return max(1, round(spent))
+
     def _sync_label(self) -> None:
         if self._live:
-            self._toggle.setText("▾  思考中")
+            self._toggle.setText(f"▾  思考中 · {self._seconds()} 秒")
             self._toggle.setToolTip("思考还在继续")
             return
-        if self._expanded:
-            self._toggle.setText("▾  思考")
-            self._toggle.setToolTip("收起思考")
-            return
-        self._toggle.setText("▸  思考")
-        self._toggle.setToolTip("展开思考")
+        arrow = "▾" if self._expanded else "▸"
+        self._toggle.setText(f"{arrow}  思考了 {self._seconds()} 秒")
+        self._toggle.setToolTip("收起思考" if self._expanded else "展开思考")
 
 
 class _EventCard(RailCard):
@@ -263,7 +330,7 @@ class _EventRow(QWidget):
         for name, value in (("eventEyebrow", eyebrow), ("eventTitle", title), ("eventDetail", detail)):
             if not value:
                 continue
-            label = QLabel(value)
+            label = QLabel(_soft_wrap(value))
             label.setObjectName(name)
             label.setWordWrap(True)
             label.setTextFormat(Qt.TextFormat.PlainText)
@@ -272,7 +339,7 @@ class _EventRow(QWidget):
                 label.setStyleSheet(f"color: {ink};")
             inner.addWidget(label)
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(0, 2, 0, 2)
+        outer.setContentsMargins(0, 4, 0, 4)
         outer.addWidget(card)
 
     def text(self) -> str:
@@ -289,77 +356,161 @@ class _EventRow(QWidget):
         menu.exec(self.mapToGlobal(pos))
 
 
+class _LogLine(QWidget):
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self._text = text
+        self._stamp = _clock()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        stamp = QLabel(self._stamp)
+        stamp.setObjectName("logTime")
+        body = QLabel(_soft_wrap(text))
+        body.setObjectName("logText")
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.TextFormat.PlainText)
+        body.setProperty("alert", bool(_LOG_ALERT.search(text)))
+        row.addWidget(stamp, alignment=Qt.AlignmentFlag.AlignTop)
+        row.addWidget(body, stretch=1)
+        self._body = body
+
+    def text(self) -> str:
+        return f"{self._stamp}  {self._text}"
+
+    def set_max_width(self, width: int) -> None:
+        self._body.setMaximumWidth(max(80, width - _LOG_GUTTER))
+
+
+class _LogStrip(QWidget):
+    """Back-to-back status lines folded into one tape; only the newest stays open."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lines: list[_LogLine] = []
+        self._expanded = False
+        self._width = 0
+        self.setAutoFillBackground(False)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._open_menu)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(_LOG_INSET, 3, 0, 3)
+        self._layout.setSpacing(3)
+        self._toggle = QPushButton()
+        self._toggle.setObjectName("logToggle")
+        self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle.setAutoDefault(False)
+        self._toggle.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self._toggle.clicked.connect(self._on_toggle)
+        self._toggle.setVisible(False)
+        self._layout.addWidget(self._toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+
+    def add_line(self, text: str) -> None:
+        line = _LogLine(text)
+        if self._width:
+            line.set_max_width(self._width)
+        self._lines.append(line)
+        self._layout.addWidget(line)
+        self._sync()
+
+    def text(self) -> str:
+        return "\n".join(line.text() for line in self._lines)
+
+    def set_max_width(self, width: int) -> None:
+        self._width = max(120, width - _LOG_INSET)
+        for line in self._lines:
+            line.set_max_width(self._width)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(COLOR_TRACK_EMPTY))
+        painter.drawRoundedRect(QRectF(1, 4, 2, max(0, self.height() - 8)), 1, 1)
+        painter.end()
+
+    def _on_toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._sync()
+
+    def _sync(self) -> None:
+        earlier = len(self._lines) - 1
+        self._toggle.setVisible(earlier > 0)
+        self._toggle.setText("▾  收起" if self._expanded else f"▸  更早 {earlier} 条")
+        self._toggle.setToolTip("" if self._expanded else "展开更早的状态记录")
+        for index, line in enumerate(self._lines):
+            line.setVisible(self._expanded or index == earlier)
+
+    def _line_at(self, pos) -> _LogLine | None:
+        widget = self.childAt(pos)
+        while widget is not None and widget is not self:
+            if isinstance(widget, _LogLine):
+                return widget
+            widget = widget.parentWidget()
+        return None
+
+    def _open_menu(self, pos) -> None:
+        menu = ThemedMenu(self)
+        line = self._line_at(pos)
+        if line is not None:
+            menu.addAction(icon_copy(), "复制这条").triggered.connect(
+                lambda: QGuiApplication.clipboard().setText(line.text())
+            )
+        if len(self._lines) > 1 or line is None:
+            menu.addAction(icon_copy(), "复制全部").triggered.connect(
+                lambda: QGuiApplication.clipboard().setText(self.text())
+            )
+        menu.exec(self.mapToGlobal(pos))
+
+
 class _MessageRow(QWidget):
+    """User: compact mint bubble on the right. Assistant: full-width notes under a speaker line."""
+
     def __init__(self, role: str, text: str, extras, assistant_name: str = "助教") -> None:
         super().__init__()
         self._role = role
         self._text = text
         self._extras = extras
+        self.assistant_side = role == "assistant"
         self.setAutoFillBackground(False)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._open_menu)
 
-        if role == "system":
-            row = QHBoxLayout(self)
-            row.setContentsMargins(2, 2, 2, 2)
-            row.setSpacing(6)
-            dot = QLabel("●")
-            dot.setObjectName("systemDot")
-            body = QLabel(text)
-            body.setObjectName("systemText")
-            body.setWordWrap(True)
-            body.setTextFormat(Qt.TextFormat.PlainText)
-            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            row.addWidget(dot, alignment=Qt.AlignmentFlag.AlignTop)
-            row.addWidget(body, stretch=1)
-            self._body = body
-            self._bubble = None
-            return
-
-        if role == "user":
-            bubble = _Bubble(COLOR_USER_BUBBLE, None, (16, 16, 6, 16))
-            margins = (14, 10, 14, 10)
-        else:
-            bubble = _Bubble(COLOR_SURFACE, COLOR_BORDER, (16, 16, 16, 16), rail=True)
-            margins = (16, 11, 14, 11)
-        inner = QVBoxLayout(bubble)
-        inner.setContentsMargins(*margins)
         body = QLabel()
         body.setObjectName("bubbleText")
         body.setWordWrap(True)
-        if role == "assistant":
+        body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        body.setMinimumHeight(18)
+        self._body = body
+        self._speaker: _Speaker | None = None
+        self._bubble: _Bubble | None = None
+
+        if role == "user":
+            body.setTextFormat(Qt.TextFormat.PlainText)
+            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            bubble = _Bubble(COLOR_USER_BUBBLE, (14, 14, 4, 14))
+            inner = QVBoxLayout(bubble)
+            inner.setContentsMargins(12, 8, 12, 8)
+            inner.addWidget(body)
+            self._bubble = bubble
+            self._layout = QHBoxLayout(self)
+            self._layout.setContentsMargins(0, _TURN_GAP, 0, 2)
+            self._layout.addStretch(1)
+            self._layout.addWidget(bubble)
+        else:
             body.setTextFormat(Qt.TextFormat.RichText)
             body.setOpenExternalLinks(True)
             body.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
             )
-        else:
-            body.setTextFormat(Qt.TextFormat.PlainText)
-            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
-        body.setMinimumHeight(18)
-        inner.addWidget(body)
-        self._body = body
-        self._bubble = bubble
+            self._speaker = _Speaker(assistant_name)
+            self._layout = QVBoxLayout(self)
+            self._layout.setContentsMargins(0, _TURN_GAP, 0, 2)
+            self._layout.setSpacing(6)
+            self._layout.addWidget(self._speaker)
+            self._layout.addWidget(body)
         self._show(text)
-
-        role_label = QLabel("你" if role == "user" else assistant_name)
-        role_label.setObjectName("bubbleRole")
-        column = QVBoxLayout()
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(6)
-        column.addWidget(role_label, alignment=Qt.AlignmentFlag.AlignRight if role == "user" else Qt.AlignmentFlag.AlignLeft)
-        column.addWidget(bubble)
-
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(0, 2, 0, 2)
-        outer.setSpacing(0)
-        if role == "user":
-            outer.addStretch(1)
-            outer.addLayout(column)
-        else:
-            outer.addLayout(column)
-            outer.addStretch(1)
 
     def text(self) -> str:
         return self._text
@@ -368,16 +519,27 @@ class _MessageRow(QWidget):
         self._text = text
         self._show(text)
 
+    def set_speaker_visible(self, visible: bool) -> None:
+        if self._speaker is None:
+            return
+        self._speaker.setVisible(visible)
+        self._layout.setContentsMargins(0, _TURN_GAP if visible else 0, 0, 2)
+
     def _show(self, text: str) -> None:
-        self._body.setText(render_markdown(text) if self._role == "assistant" else text)
+        self._body.setText(render_markdown(text) if self._role == "assistant" else _soft_wrap(text))
 
     def set_max_width(self, width: int) -> None:
         if self._bubble is None:
+            self._body.setMaximumWidth(max(120, width))
             return
-        capped = max(120, width)
+        capped = max(120, int(width * _USER_SHARE))
         self._bubble.setMaximumWidth(capped)
-        inset = 32 if self._role == "assistant" else 28
-        self._body.setMaximumWidth(max(80, capped - inset))
+        lane = max(80, capped - 24)
+        self._body.setMaximumWidth(lane)
+        self._body.ensurePolished()
+        metrics = self._body.fontMetrics()
+        natural = max((metrics.horizontalAdvance(line) for line in self._text.splitlines()), default=0) + 2
+        self._body.setMinimumWidth(min(natural, lane))
 
     def _open_menu(self, pos) -> None:
         menu = ThemedMenu(self)
@@ -405,19 +567,55 @@ class _MessageRow(QWidget):
         menu.exec(self.mapToGlobal(pos))
 
     def _copy(self) -> None:
-        selected = self._body.selectedText()
+        selected = self._body.selectedText().replace("\u200b", "")
         QGuiApplication.clipboard().setText(selected or self._text)
+
+
+class _ElidedLabel(QLabel):
+    """One-line label that shrinks with a trailing ellipsis instead of widening its row."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+    def set_full_text(self, text: str) -> None:
+        self._full = text
+        self.setToolTip(text)
+        self._elide()
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(self.fontMetrics().horizontalAdvance(self._full) + 4, super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self) -> None:
+        self.setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, self.width()))
+
+
+_MODE_SPECS: tuple[tuple[str, Callable[[], QIcon], str, str], ...] = (
+    ("tutor", icon_project, "学习", "跟着步骤搭建 Arduino 实验"),
+    ("repair", icon_repair, "维修", "诊断故障并在画面上标出检查点"),
+)
 
 
 class ChatWidget(QWidget):
     send_requested = Signal(str)
     voice_session_toggled = Signal(bool)
+    mode_change_requested = Signal(str)
+    thinking_toggled = Signal(bool)
 
     def __init__(self, model_name: str = "") -> None:
         super().__init__()
         self._stream_open = False
         self._stream_row: _MessageRow | None = None
-        self._rows: list[_MessageRow] = []
+        self._rows: list[QWidget] = []
         self._thinking: _ThinkingNote | None = None
         self._notes: list[_ThinkingNote] = []
         self._context_actions: list[QAction] = []
@@ -433,22 +631,20 @@ class ChatWidget(QWidget):
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        viewport = self._scroll.viewport()
-        viewport.setAutoFillBackground(True)
-        palette = viewport.palette()
-        palette.setColor(QPalette.ColorRole.Window, QColor(COLOR_SURFACE))
-        viewport.setPalette(palette)
+        self._scroll.viewport().setAutoFillBackground(False)
 
         self._transcript = QWidget()
+        self._transcript.setObjectName("chatTranscript")
         self._transcript.setAutoFillBackground(False)
         self._transcript.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._transcript.customContextMenuRequested.connect(self._open_area_menu)
         self._list = QVBoxLayout(self._transcript)
-        self._list.setContentsMargins(0, 0, 4, 0)
-        self._list.setSpacing(8)
-        self._placeholder = QLabel("提问会显示在这里")
+        self._list.setContentsMargins(0, 0, 6, 4)
+        self._list.setSpacing(4)
+        self._placeholder = QLabel(_EMPTY_HINTS["tutor"])
         self._placeholder.setObjectName("chatPlaceholder")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._placeholder.setWordWrap(True)
         self._list.addWidget(self._placeholder)
         self._list.addStretch(1)
         self._scroll.setWidget(self._transcript)
@@ -457,8 +653,8 @@ class ChatWidget(QWidget):
         composer = RoundedCard(14)
         composer.setObjectName("composer")
         composer_layout = QVBoxLayout(composer)
-        composer_layout.setContentsMargins(12, 10, 12, 10)
-        composer_layout.setSpacing(6)
+        composer_layout.setContentsMargins(12, 10, 12, 8)
+        composer_layout.setSpacing(8)
 
         self._input = QLineEdit()
         self._input.setObjectName("composerInput")
@@ -468,27 +664,61 @@ class ChatWidget(QWidget):
         composer_layout.addWidget(self._input)
 
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(6)
+
+        self._mode_actions: dict[str, QAction] = {}
+        mode_menu = ThemedMenu(self)
+        mode_menu.setObjectName("appMenu")
+        self._mode_group = QActionGroup(self)
+        self._mode_group.setExclusive(True)
+        for mode, icon_fn, label, tip in _MODE_SPECS:
+            action = mode_menu.addAction(icon_fn(), label)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.setToolTip(tip)
+            self._mode_group.addAction(action)
+            self._mode_actions[mode] = action
+        self._mode_actions["tutor"].setChecked(True)
+        self._mode_group.triggered.connect(self._on_mode_picked)
+
+        self._mode_btn = QToolButton()
+        style_sidebar_chip(self._mode_btn)
+        self._mode_btn.setMenu(mode_menu)
+        self._mode_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._mode_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._mode_btn.setIconSize(QSize(20, 16))
+        self._sync_mode_button("tutor")
+
+        self._think_btn = QPushButton("思考")
+        style_sidebar_chip(self._think_btn)
+        self._think_btn.setCheckable(True)
+        self._think_btn.setChecked(True)
+        self._think_btn.setToolTip("开启后模型会先推理再回答；关闭可加快回复")
+        self._think_btn.toggled.connect(self.thinking_toggled.emit)
+
         self._voice_status = QLabel("")
         self._voice_status.setObjectName("voiceStatus")
         self._voice_status.setVisible(False)
-        self._ptt = QPushButton("语音辅导")
-        self._ptt.setObjectName("voiceButton")
+        self._ptt = QPushButton("语音")
+        style_sidebar_chip(self._ptt)
         self._ptt.setCheckable(True)
-        self._ptt.setToolTip("点一下开始语音辅导，再说一次结束。开口即可打断老师。")
+        self._ptt.setToolTip("开启语音辅导；再次点击结束。说话时可打断助手。")
         self._ptt.toggled.connect(self._on_voice_toggled)
-        self._model_label = model = QLabel()
+        self._model_label = model = _ElidedLabel()
         model.setObjectName("modelLabel")
         self.set_model_name(model_name)
-        send_btn = QPushButton("↑")
-        send_btn.setObjectName("sendButton")
+        self._send_btn = send_btn = QPushButton("↑")
+        style_sidebar_chip(send_btn, compact=True)
+        send_btn.setObjectName("chatSend")
         send_btn.setToolTip("发送")
-        send_btn.setFixedSize(32, 32)
+        send_btn.setEnabled(False)
         send_btn.clicked.connect(self._on_send)
+        self._input.textChanged.connect(lambda text: send_btn.setEnabled(bool(text.strip())))
+        row.addWidget(self._mode_btn)
+        row.addWidget(self._think_btn)
         row.addWidget(self._voice_status)
         row.addWidget(self._ptt)
-        row.addStretch(1)
-        row.addWidget(model)
+        row.addWidget(model, stretch=1)
         row.addWidget(send_btn)
         composer_layout.addLayout(row)
         layout.addWidget(composer)
@@ -508,14 +738,43 @@ class ChatWidget(QWidget):
     def set_input_placeholder(self, text: str) -> None:
         self._input.setPlaceholderText(text)
 
+    def set_mode(self, mode: str) -> None:
+        if mode not in self._mode_actions:
+            return
+        self._mode_group.blockSignals(True)
+        self._mode_actions[mode].setChecked(True)
+        self._mode_group.blockSignals(False)
+        self._sync_mode_button(mode)
+
+    def _sync_mode_button(self, mode: str) -> None:
+        spec = next(item for item in _MODE_SPECS if item[0] == mode)
+        _, icon_fn, label, tip = spec
+        self._mode_btn.setText(f"{label} ▾")
+        self._mode_btn.setIcon(with_label_gap(icon_fn(), 4))
+        self._mode_btn.setToolTip(tip)
+        self._placeholder.setText(_EMPTY_HINTS.get(mode, ""))
+
+    def _on_mode_picked(self, action: QAction) -> None:
+        mode = str(action.data())
+        self._sync_mode_button(mode)
+        self.mode_change_requested.emit(mode)
+
+    def set_thinking_enabled(self, enabled: bool) -> None:
+        self._think_btn.blockSignals(True)
+        self._think_btn.setChecked(enabled)
+        self._think_btn.blockSignals(False)
+
+    def thinking_enabled(self) -> bool:
+        return self._think_btn.isChecked()
+
     def set_model_name(self, name: str) -> None:
-        self._model_label.setText(name)
+        self._model_label.set_full_text(name)
         self._model_label.setVisible(bool(name))
 
     def set_voice_checked(self, checked: bool) -> None:
         self._ptt.blockSignals(True)
         self._ptt.setChecked(checked)
-        self._ptt.setText("结束辅导" if checked else "语音辅导")
+        self._ptt.setText("结束" if checked else "语音")
         self._ptt.blockSignals(False)
 
     def set_voice_status(self, text: str) -> None:
@@ -523,7 +782,7 @@ class ChatWidget(QWidget):
         self._voice_status.setVisible(bool(text))
 
     def _on_voice_toggled(self, checked: bool) -> None:
-        self._ptt.setText("结束辅导" if checked else "语音辅导")
+        self._ptt.setText("结束" if checked else "语音")
         self.voice_session_toggled.emit(checked)
 
     def _on_send(self) -> None:
@@ -542,7 +801,16 @@ class ChatWidget(QWidget):
         self._append_row("assistant", text)
 
     def append_system(self, text: str) -> None:
-        self._place_before_stream(self._make_row("system", text))
+        index = self._insert_index()
+        before = self._list.itemAt(index - 1).widget() if index > 0 else None
+        if isinstance(before, _LogStrip):
+            before.add_line(text)
+            self._after_insert()
+            return
+        strip = _LogStrip()
+        strip.set_max_width(self._lane_width())
+        strip.add_line(text)
+        self._place_before_stream(strip)
 
     def append_event(
         self, eyebrow: str, title: str, detail: str = "", tone: str = "info", stamp: str = ""
@@ -553,12 +821,13 @@ class ChatWidget(QWidget):
     def set_assistant_name(self, name: str) -> None:
         self._assistant_name = name
 
-    def _place_before_stream(self, row) -> None:
+    def _insert_index(self) -> int:
         if self._stream_open and self._stream_row is not None:
-            index = self._list.indexOf(self._stream_row)
-            self._list.insertWidget(index, row)
-        else:
-            self._place(row)
+            return self._list.indexOf(self._stream_row)
+        return self._list.count() - 1
+
+    def _place_before_stream(self, row: QWidget) -> None:
+        self._list.insertWidget(self._insert_index(), row)
         self._rows.append(row)
         self._after_insert()
 
@@ -637,23 +906,19 @@ class ChatWidget(QWidget):
         self._stream_row = None
 
     def _append_row(self, role: str, text: str) -> _MessageRow:
-        row = self._make_row(role, text)
+        row = _MessageRow(role, text, self._context_actions_now, self._assistant_name)
+        row.set_max_width(self._lane_width())
         self._place(row)
         self._rows.append(row)
         self._after_insert()
-        return row
-
-    def _make_row(self, role: str, text: str) -> _MessageRow:
-        row = _MessageRow(role, text, self._context_actions_now, self._assistant_name)
-        row.set_max_width(self._bubble_width())
         return row
 
     def _place(self, row: QWidget) -> None:
         self._list.insertWidget(self._list.count() - 1, row)
 
     def _insert_thinking(self) -> None:
-        note = _ThinkingNote()
-        note.set_max_width(self._bubble_width())
+        note = _ThinkingNote(self._assistant_name)
+        note.set_max_width(self._lane_width())
         self._place(note)
         self._notes.append(note)
         self._thinking = note
@@ -666,12 +931,29 @@ class ChatWidget(QWidget):
             self._thinking = None
         self._list.removeWidget(note)
         note.deleteLater()
-        if not self._rows and not self._notes:
-            self._placeholder.show()
+        self._after_remove()
 
     def _after_insert(self) -> None:
         self._placeholder.hide()
+        self._relabel()
         self._scroll_bottom()
+
+    def _after_remove(self) -> None:
+        self._relabel()
+        if not self._rows and not self._notes:
+            self._placeholder.show()
+
+    def _relabel(self) -> None:
+        """Show the speaker line only where the assistant starts talking after someone or something else."""
+        after_assistant = False
+        for index in range(self._list.count()):
+            widget = self._list.itemAt(index).widget()
+            if widget is None or widget is self._placeholder:
+                continue
+            assistant_side = getattr(widget, "assistant_side", False)
+            if assistant_side:
+                widget.set_speaker_visible(not after_assistant)
+            after_assistant = assistant_side
 
     def _remove_stream_row(self) -> None:
         row = self._stream_row
@@ -682,14 +964,14 @@ class ChatWidget(QWidget):
             self._rows.remove(row)
         self._list.removeWidget(row)
         row.deleteLater()
-        if not self._rows and not self._notes:
-            self._placeholder.show()
+        self._after_remove()
 
-    def _bubble_width(self) -> int:
-        return max(140, int(self._scroll.viewport().width() * 0.8))
+    def _lane_width(self) -> int:
+        margins = self._list.contentsMargins()
+        return max(160, self._scroll.viewport().width() - margins.left() - margins.right())
 
     def _sync_widths(self) -> None:
-        width = self._bubble_width()
+        width = self._lane_width()
         for row in self._rows:
             row.set_max_width(width)
         for note in self._notes:
