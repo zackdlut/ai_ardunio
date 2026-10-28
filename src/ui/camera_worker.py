@@ -35,6 +35,10 @@ class CameraWorker(QThread):
         self._reopen_camera = False
         self._overlay_hint: dict[str, Any] = {}
         self._user_marks: list[dict[str, Any]] = []
+        self._mode = "tutor"
+        self._annotations: list[dict[str, Any]] = []
+        self._frozen = False
+        self._frozen_frame: np.ndarray | None = None
         self._force_rescan = False
         self._models_ready = False
         self._infer_busy = False
@@ -61,6 +65,26 @@ class CameraWorker(QThread):
     def set_user_marks(self, marks: list[dict[str, Any]]) -> None:
         self._mutex.lock()
         self._user_marks = [dict(item) for item in marks]
+        self._mutex.unlock()
+
+    def set_mode(self, mode: str) -> None:
+        """``repair`` skips YOLO (it only knows Arduino parts); gestures keep running."""
+        self._mutex.lock()
+        self._mode = mode
+        if mode == "repair":
+            self._last_detections = []
+        self._mutex.unlock()
+
+    def set_annotations(self, annotations: list[dict[str, Any]]) -> None:
+        self._mutex.lock()
+        self._annotations = [dict(item) for item in annotations]
+        self._mutex.unlock()
+
+    def set_frozen(self, frozen: bool) -> None:
+        self._mutex.lock()
+        self._frozen = frozen
+        if not frozen:
+            self._frozen_frame = None
         self._mutex.unlock()
 
     def set_paused(self, paused: bool) -> None:
@@ -191,12 +215,13 @@ class CameraWorker(QThread):
             force = self._force_rescan
             if force:
                 self._force_rescan = False
+            repair = self._mode == "repair"
             self._mutex.unlock()
             try:
                 if frame is None:
                     continue
                 self._read_gesture(frame)
-                if paused and not force:
+                if repair or (paused and not force):
                     continue
                 dets = self._detect_fast(frame)
                 tracked = self._tracker.update(dets)
@@ -246,22 +271,31 @@ class CameraWorker(QThread):
             self._mutex.lock()
             paused = self._paused
             ready = self._models_ready
-            detections = list(self._last_detections)
+            repair = self._mode == "repair"
+            detections = [] if repair else list(self._last_detections)
             hint = dict(self._overlay_hint)
             marks = [dict(item) for item in self._user_marks]
+            annotations = [dict(item) for item in self._annotations]
             hand = list(self._hand_points) if self._hand_points else None
+            frozen = self._frozen
+            if frozen and self._frozen_frame is None:
+                self._frozen_frame = frame.copy()
+            base = self._frozen_frame if frozen else frame
             self._mutex.unlock()
             if ready:
                 self._submit_infer(frame)
 
             shown = self._overlay.render(
-                frame,
+                base,
                 detections,
                 hint=hint,
                 marks=marks,
                 paused=paused,
                 pulse=time.monotonic(),
-                hand=hand,
+                hand=None if frozen else hand,
+                mode="repair" if repair else "tutor",
+                annotations=annotations,
+                frozen=frozen,
             )
             self.frame_ready.emit(shown)
 

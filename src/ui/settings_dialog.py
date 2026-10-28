@@ -1,4 +1,4 @@
-"""Chat model and ASR settings, saved to .env and applied without a restart."""
+"""Chat model, ASR and repair-mode settings, saved to .env and applied without a restart."""
 
 from __future__ import annotations
 
@@ -23,6 +23,23 @@ CHAT_KEYS = frozenset(
     {"OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL", "LLM_VISION", "LLM_EXTRA_BODY", "LLM_TIMEOUT_S"}
 )
 
+REPAIR_KEYS = frozenset(
+    {
+        "IFIXIT_ENABLED",
+        "IFIXIT_BASE_URL",
+        "IFIXIT_TIMEOUT_S",
+        "REPAIR_DOCS_DIR",
+        "REPAIR_FRAME_MAX_SIDE",
+        "REPAIR_BOX_FORMAT",
+    }
+)
+
+_ON_OFF = (("true", "开启"), ("false", "关闭"))
+_BOX_FORMATS = (
+    ("norm1000", "0–1000 相对坐标（Qwen-VL 等）"),
+    ("norm1", "0–1 相对坐标"),
+    ("pixel", "所发图片的像素坐标"),
+)
 _ASR_BACKENDS = (("local", "本地 Whisper"), ("ollama", "远程 Ollama"), ("openai", "远程 API"))
 _VISION_CHOICES = (("auto", "自动判断"), ("true", "发送"), ("false", "不发送"))
 _API_MODES = (
@@ -102,6 +119,7 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(self._build_chat_tab(settings), "对话模型")
         tabs.addTab(self._build_asr_tab(settings, asr_backend), "语音识别")
+        tabs.addTab(self._build_repair_tab(settings), "维修模式")
 
         self._error = QLabel()
         self._error.setObjectName("settingsError")
@@ -203,6 +221,31 @@ class SettingsDialog(QDialog):
         self._show_backend_rows()
         return page
 
+    def _build_repair_tab(self, cfg: Settings) -> QWidget:
+        page, form = _form()
+        self._ifixit_enabled = _choice(_ON_OFF, "true" if cfg.ifixit_enabled else "false")
+        self._ifixit_url = _line(cfg.ifixit_base_url, "https://www.ifixit.com/api/2.0")
+        self._ifixit_timeout = _seconds(cfg.ifixit_timeout_s)
+        self._repair_docs = _line(str(cfg.repair_docs_dir), "data/repair_docs")
+        self._repair_side = QSpinBox()
+        self._repair_side.setRange(480, 2560)
+        self._repair_side.setSingleStep(64)
+        self._repair_side.setSuffix(" px")
+        self._repair_side.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self._repair_side.setValue(int(cfg.repair_frame_max_side))
+        self._repair_box = _choice(_BOX_FORMATS, cfg.repair_box_format)
+        _row(form, "iFixit 查询", self._ifixit_enabled)
+        _row(form, "iFixit 地址", self._ifixit_url)
+        _row(form, "iFixit 超时", self._ifixit_timeout)
+        _row(form, "资料存放目录", self._repair_docs)
+        _row(form, "附图长边", self._repair_side)
+        _row(form, "标注坐标格式", self._repair_box)
+        form.addRow(_note(
+            "iFixit 是外网服务，经 HTTPS_PROXY 出网。附图长边越大，丝印看得越清，请求也越大。"
+            "标注坐标格式要与视觉模型的输出习惯一致，框总是偏移时可以换一种试试。"
+        ))
+        return page
+
     def _show_backend_rows(self) -> None:
         current = self._asr_backend.currentData()
         for backend, widgets in self._asr_rows.items():
@@ -230,6 +273,12 @@ class SettingsDialog(QDialog):
             "ASR_MODEL": self._asr_model.text().strip(),
             "ASR_API_MODE": self._asr_mode.currentData(),
             "ASR_EXTRA_BODY": self._asr_extra.text().strip(),
+            "IFIXIT_ENABLED": self._ifixit_enabled.currentData(),
+            "IFIXIT_BASE_URL": self._ifixit_url.text().strip(),
+            "IFIXIT_TIMEOUT_S": str(self._ifixit_timeout.value()),
+            "REPAIR_DOCS_DIR": self._repair_docs.text().strip(),
+            "REPAIR_FRAME_MAX_SIDE": str(self._repair_side.value()),
+            "REPAIR_BOX_FORMAT": self._repair_box.currentData(),
         }
 
     def _save(self) -> None:

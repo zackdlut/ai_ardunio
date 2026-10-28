@@ -402,6 +402,34 @@ def app_stylesheet() -> str:
         background: transparent;
     }}
 
+    QListWidget#checkList {{
+        background-color: #F7FAF8;
+        border: 1px solid {COLOR_BORDER};
+        border-radius: 8px;
+        padding: 4px;
+        font-size: 12px;
+        outline: none;
+    }}
+
+    QListWidget#checkList::item {{
+        padding: 3px 6px;
+        border-radius: 6px;
+    }}
+
+    QListWidget#checkList::item:selected {{
+        background-color: {COLOR_ACCENT_SOFT};
+        color: {COLOR_TEXT};
+    }}
+
+    QLabel#conclusionCard {{
+        background-color: {COLOR_ACCENT_SOFT};
+        border: 1px solid #CDEBDD;
+        border-radius: 10px;
+        padding: 8px 10px;
+        color: {COLOR_TEXT};
+        font-size: 12px;
+    }}
+
     QDialog#settingsDialog {{
         background-color: {COLOR_BG};
     }}

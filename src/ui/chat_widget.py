@@ -400,6 +400,9 @@ class ChatWidget(QWidget):
     def _context_actions_now(self) -> list[QAction]:
         return self._context_actions
 
+    def set_input_placeholder(self, text: str) -> None:
+        self._input.setPlaceholderText(text)
+
     def set_model_name(self, name: str) -> None:
         self._model_label.setText(name)
         self._model_label.setVisible(bool(name))

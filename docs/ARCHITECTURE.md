@@ -22,6 +22,7 @@
 | 会话记录 | SQLite（`data/copilot.db`）：`sessions` + 步骤推进写入 `step_history` |
 | 语音辅导 | 开麦 `VoiceSession`（能量 VAD）+ ASR + 按句 TTS；讲解中可打断 |
 | 导师上下文 | `build_extra_system` 注入步骤、视觉校验、画面标记；对话记忆最近 20 条 |
+| 维修模式 | 维修单 + 检查清单 + 视觉模型给坐标的画面标注 + 原理图检索 + iFixit 指南，见第 14 节 |
 
 **入口**：`python src/main.py` → 把仓库根目录和 `src/` 加入 `sys.path` → 加载 `.env` → `init_db()` → `QApplication` + `apply_theme` → `MainWindow`。
 
@@ -49,6 +50,7 @@ ai_ardunio/
 │   ├── overlay/                # OpenCV 绘制与中文文字精灵
 │   ├── gesture/                # MediaPipe 手势与去抖
 │   ├── project/                # 状态机、ORM、会话仓库
+│   ├── repair/                 # 维修单 ORM 与服务、资料库、iFixit 客户端、标注坐标换算
 │   ├── arduino/                # CLI 封装、串口列表、串口监视封装
 │   └── voice/                  # 开麦会话、VAD、ASR、TTS、分句
 └── docs/ARCHITECTURE.md        # 本文档
@@ -757,8 +759,12 @@ TTS 只有本机后端（pyttsx3 / Windows SAPI），音色与语速为 `TTS_VOI
 | `TTS_ENABLED` | 启动时「语音回复」是否勾选 |
 | `TTS_VOICE` / `TTS_RATE` | 本机 TTS 音色与语速 |
 | `VAD_*` | 开麦端点：噪声倍数、最短语音、静音结尾、打断阈值与回声宽限 |
+| `IFIXIT_ENABLED` / `IFIXIT_BASE_URL` / `IFIXIT_TIMEOUT_S` | 维修模式 iFixit 查询开关、API 根路径、超时 |
+| `REPAIR_DOCS_DIR` | 上传资料存放目录，默认 `data/repair_docs` |
+| `REPAIR_FRAME_MAX_SIDE` | 维修模式附图长边，默认 `1280` |
+| `REPAIR_BOX_FORMAT` | 模型输出框的坐标约定：`norm1000`（默认）/ `norm1` / `pixel` |
 
-顶栏「设置」打开 `SettingsDialog`（`src/ui/settings_dialog.py`），可编辑上表中 `OPENAI_*`、`LLM_*`、`ASR_*`、`WHISPER_*`、`OLLAMA_*` 各项。保存时只取有改动的键，先用 `Settings(**改动)` 校验，失败就在窗口内提示、不写文件；通过后由 `config/env_file.py` 原位改写 `.env`（保留注释与顺序，新键追加到末尾），同时写入 `os.environ`，因为进程环境变量优先于 `.env`。主窗口随后刷新 ASR 菜单提示并重建 ASR；对话相关键有变化时更新模型标签并新起 `LLMConnectWorker`，只接受最新一次连接的结果。
+顶栏「设置」打开 `SettingsDialog`（`src/ui/settings_dialog.py`），可编辑上表中 `OPENAI_*`、`LLM_*`、`ASR_*`、`WHISPER_*`、`OLLAMA_*` 各项，以及「维修模式」页的 `IFIXIT_*`、`REPAIR_*`。保存时只取有改动的键，先用 `Settings(**改动)` 校验，失败就在窗口内提示、不写文件；通过后由 `config/env_file.py` 原位改写 `.env`（保留注释与顺序，新键追加到末尾），同时写入 `os.environ`，因为进程环境变量优先于 `.env`。主窗口随后刷新 ASR 菜单提示并重建 ASR；对话相关键有变化时更新模型标签并新起 `LLMConnectWorker`，只接受最新一次连接的结果。
 
 `VAD_NOISE_MULTIPLIER`、`VAD_ONSET_MS`、`VAD_SILENCE_MS`、`VAD_BARGE_MS`、`VAD_BARGE_MIN_RMS`、`VAD_BARGE_GRACE_MS` 等完整默认值见 `config/settings.py`。
 
@@ -776,7 +782,96 @@ TTS 只有本机后端（pyttsx3 / Windows SAPI），音色与语速为 `TTS_VOI
 
 ---
 
-## 14. 本地复现「单步聊天」的调试方式
+## 14. 维修模式
+
+顶栏「模式」菜单在**教学模式**和**维修模式**之间切换。维修模式面向任意电路板和电子设备：先记下设备和故障现象，再由模型生成检查清单，在画面上框出要查的位置；用户回报测量结果后，模型收窄范围，最后给出结论和处置步骤。需要时模型可以检索用户上传的原理图或维修手册，也可以查 iFixit。
+
+### 14.1 与教学模式的区别
+
+| 方面 | 教学模式 | 维修模式 |
+|------|----------|----------|
+| 侧栏上半部 | 步骤标题、提示、进度条 | `RepairPanel`：维修单、检查清单、回报按钮、资料、结论卡片 |
+| 视觉定位 | YOLO 检测框 + 引脚相对区域 | 不跑 YOLO（只认 6 类 Arduino 器件），由视觉大模型在附图上直接给坐标 |
+| 系统提示 | `SYSTEM_PROMPT` | `REPAIR_SYSTEM_PROMPT`（安全、排查顺序、测量写法、资料用法） |
+| 附加上下文 | `build_extra_system` | `build_repair_extra_system`：维修单、清单状态与实测值、资料列表、当前标注、用户标记、坐标约定 |
+| 附图长边 | `LLM_FRAME_MAX_SIDE`（768） | `REPAIR_FRAME_MAX_SIDE`（1280，看得清丝印） |
+| 工具轮次上限 | 6 | 10 |
+| 手势「赞」 | 下一步 | 下一个待查项 |
+
+切换模式会清空对话记忆和画面标记；进行中的回复会被取消。手势检测在两种模式下都照常运行。
+
+```mermaid
+flowchart LR
+    User[用户描述故障或点回报] --> MW[MainWindow]
+    MW -->|附图 + repair 上下文| Worker[LLMWorker]
+    Worker --> Tools[repair_tools handlers]
+    Tools --> Cases[(CaseManager SQLite)]
+    Tools --> Lib[DocumentLibrary PyMuPDF]
+    Tools --> IFX[IFixitClient httpx]
+    Tools -->|on_change| Bridge[_RepairBridge.changed]
+    Bridge --> Panel[RepairPanel 刷新]
+    Bridge --> Cam[CameraWorker set_annotations / set_overlay_hint]
+    Lib -->|pending_images| Worker
+```
+
+### 14.2 画面标注
+
+- 模型调用 `annotate` 或带 `box` 的 `propose_checklist`，框写成 `[x1,y1,x2,y2]`。`repair/annotations.py` 按 `REPAIR_BOX_FORMAT` 换算到 0 到 1：`norm1000`（默认，Qwen-VL 习惯）、`norm1`、`pixel`（按本轮实际发送的图片尺寸 `sent_image_size`）。四个数都不超过 1 时一律按 0 到 1 处理；越界会裁剪，太小或格式不对的框丢弃并在工具结果里说明。
+- `OverlayEngine.render(mode="repair")` 不画 YOLO 框，改画标注：`check` 琥珀色、`fault` 红色脉动、`ok` 绿色、`danger` 红色斜线。当前检查项对应的标注加粗，并显示说明。顶部 HUD 显示「检查 N/M · 标题 · 预期值」。
+- 回报结果会改标注颜色：异常变 `fault`，正常和跳过变 `ok`，实测值写进说明。
+- **定格画面**：`CameraWorker.set_frozen(True)` 缓存当前帧，之后一直在这张图上叠加标注，发给模型的也是这张图。拿起板子测量时标注不会错位。
+
+### 14.3 维修数据（SQLite）
+
+| 表 | 主要字段 |
+|----|----------|
+| `repair_cases` | 设备、现象、状态 open/closed、结论、处置步骤（JSON 数组）、安全提醒、当前检查项 |
+| `repair_checks` | 所属维修单、序号、标题、操作说明、预期、位置框（0 到 1 的 JSON）、kind、状态 pending/pass/fail/skip、实测值、备注 |
+| `repair_documents` | 所属维修单（空表示共享）、文件名、存储路径、类型 pdf/image、页数、是否有文字 |
+
+`CaseManager` 每次操作开一个短 session，LLM 工作线程和主线程都可调用。启动时自动接上最近一个未关闭的维修单；「新建」会关闭旧单。
+
+### 14.4 维修工具
+
+| 工具 | 作用 |
+|------|------|
+| `get_repair_case` | 维修单、清单、资料列表、当前标注 |
+| `update_repair_case` | 记录设备与现象，没有维修单就新建 |
+| `propose_checklist` | 追加检查项（`replace_pending` 可替换未查项），有框的同时标在画面 |
+| `focus_check` | 设为当前项 |
+| `record_check_result` | 记录 pass/fail/skip 与实测值，返回下一个待查项 |
+| `annotate` / `clear_annotations` | 画或清除标注，最多保留 12 个，同名或同检查项的会替换 |
+| `search_documents` | 资料关键词检索，返回文档、页码、片段 |
+| `view_document_page` | 渲染一页或页内局部（`region` 为 0 到 1 范围），作为图片交给模型 |
+| `ifixit_search` / `ifixit_get_guide` / `ifixit_device` | iFixit 搜索、指南步骤（每次最多 12 步，`start_step` 分段）、设备页 |
+| `conclude` | 诊断结论、处置步骤、安全提醒，显示在侧栏 |
+
+`IFIXIT_ENABLED=false` 时不注册三个 iFixit 工具。工具抛异常或参数不对时，错误文字作为工具结果返回给模型，不会中断本轮对话。
+
+侧栏操作走同一套 `RepairContext` 方法。回报「异常」或清单查完时，自动发一条消息让模型分析；回报「正常 / 跳过」只在对话里记一笔并跳到下一项，避免频繁调用模型。
+
+### 14.5 工具返回图片
+
+工具结果只能是文本，所以 `view_document_page` 把 `(说明, data URL)` 放进 `RepairContext` 的待发队列。`LLMClient` 在每轮工具执行完后调用 `drain_images`，追加一条 `role: user` 消息（一段文字加若干 `image_url`），下一轮请求就能看到原理图：
+
+```json
+{ "role": "user", "content": [
+  { "type": "text", "text": "以下是工具返回的图片，供你查看：board.pdf 第 2 页（局部 0.00, 0.00, 0.50, 0.30）" },
+  { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,…" } }
+] }
+```
+
+模型已知不支持图片时，改为追加一句文字说明。若带工具图片的请求返回 400，会去掉图片重试一次并停用看图；这次重试只重发模型请求，不会重跑工具。
+
+### 14.6 资料库与 iFixit
+
+- 上传：侧栏「上传」选 PDF 或图片，`DocIngestWorker` 在后台复制到 `REPAIR_DOCS_DIR/<随机目录>/`，PDF 逐页抽文字写入 `pages.json`。扫描件抽不到文字，标记为 `has_text=false`，只能看图。
+- 检索：英文和数字按词切分并保留整体（`vcc_3v3` 同时产生 `vcc`、`3v3`），中文两字一组；按词频和稀有度打分，位号、网络名的权重高于中文词。
+- iFixit：`GET /search/{q}?filter=guide|wiki`、`GET /guides/{id}`、`GET /wikis/CATEGORY/{device}`，只读、不需要 Key。httpx 读取环境变量里的代理，因此经 `HTTPS_PROXY` 出网；结果缓存 30 分钟；超时、404、网络错误都返回中文 `error`。iFixit 内容以英文为主，工具描述要求模型用英文设备名搜索，并注明来源。
+
+---
+
+## 15. 本地复现「单步聊天」的调试方式
 
 不抓包也可在应用侧观察往返：
 
@@ -801,7 +896,7 @@ curl.exe -s http://10.67.34.44:11434/v1/chat/completions `
 
 ---
 
-## 15. 相关源码索引
+## 16. 相关源码索引
 
 | 主题 | 文件 |
 |------|------|
@@ -822,8 +917,11 @@ curl.exe -s http://10.67.34.44:11434/v1/chat/completions `
 | 手势 | `src/gesture/mediapipe_ctrl.py`、`src/gesture/debounce.py` |
 | 开麦 / VAD / ASR / TTS | `src/voice/session.py`、`vad.py`、`asr.py`、`tts.py`、`sentences.py` |
 | 开发板与烧录 | `src/arduino/board_manager.py`、`compile_manager.py`、`upload_manager.py` |
+| 维修侧栏 | `src/ui/repair_panel.py` |
+| 维修工具 / 上下文 | `src/agent/repair_tools.py`、`src/agent/repair_context.py` |
+| 维修单 / 资料库 / iFixit / 标注坐标 | `src/repair/case_manager.py`、`models.py`、`documents.py`、`ifixit.py`、`annotations.py` |
 | 配置 | `config/settings.py`、`.env` |
 
 ---
 
-*文档版本：与当前源码同步。扩展 Agent 工具、项目 JSON 或语音状态机时，请同步更新第 6、7、10 节。*
+*文档版本：与当前源码同步。扩展 Agent 工具、项目 JSON 或语音状态机时，请同步更新第 6、7、10 节；改动维修工具或数据表时更新第 14 节。*

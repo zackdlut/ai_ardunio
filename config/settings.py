@@ -11,6 +11,7 @@ AsrApiMode = Literal["transcriptions", "chat"]
 LlmVision = Literal["auto", "true", "false"]
 TtsBackend = Literal["local"]
 YoloDevice = Literal["auto", "cpu", "gpu", "npu"]
+RepairBoxFormat = Literal["norm1000", "norm1", "pixel"]
 
 _ASR_BACKEND_ALIASES = {"remote": "ollama", "whisper": "local"}
 
@@ -89,7 +90,20 @@ class Settings(BaseSettings):
     )
     projects_dir: Path = Field(default=ROOT_DIR / "config" / "projects")
 
-    @field_validator("asr_backend", "asr_api_mode", "llm_vision", "yolo_device", mode="before")
+    ifixit_enabled: bool = Field(default=True, alias="IFIXIT_ENABLED")
+    ifixit_base_url: str = Field(
+        default="https://www.ifixit.com/api/2.0", alias="IFIXIT_BASE_URL"
+    )
+    ifixit_timeout_s: float = Field(default=15.0, alias="IFIXIT_TIMEOUT_S")
+    repair_docs_dir: Path = Field(
+        default=ROOT_DIR / "data" / "repair_docs", alias="REPAIR_DOCS_DIR"
+    )
+    repair_frame_max_side: int = Field(default=1280, alias="REPAIR_FRAME_MAX_SIDE")
+    repair_box_format: RepairBoxFormat = Field(default="norm1000", alias="REPAIR_BOX_FORMAT")
+
+    @field_validator(
+        "asr_backend", "asr_api_mode", "llm_vision", "yolo_device", "repair_box_format", mode="before"
+    )
     @classmethod
     def _normalize_choice(cls, value: object) -> str:
         if isinstance(value, str):

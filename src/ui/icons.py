@@ -69,6 +69,16 @@ def icon_project() -> QIcon:
     return _stroke_icon(draw)
 
 
+def icon_repair() -> QIcon:
+    def draw(p: QPainter) -> None:
+        p.drawArc(QRectF(8, 2, 6, 6), 200 * 16, 270 * 16)
+        p.drawLine(QPointF(9.2, 6.8), QPointF(3, 13))
+        p.drawLine(QPointF(4.6, 14.2), QPointF(10.6, 8.2))
+        p.drawLine(QPointF(3, 13), QPointF(4.6, 14.2))
+
+    return _stroke_icon(draw)
+
+
 def icon_hardware() -> QIcon:
     def draw(p: QPainter) -> None:
         p.drawRoundedRect(QRectF(4.5, 4.5, 7, 7), 1.4, 1.4)

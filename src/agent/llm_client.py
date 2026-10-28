@@ -36,6 +36,9 @@ class _StreamInterrupted(Exception):
 
 _CONNECT_HINT = "请检查 OPENAI_BASE_URL、OPENAI_API_KEY 与代理（NO_PROXY / HTTPS_PROXY）"
 
+# (caption, data URL) pairs produced by tools such as view_document_page.
+ToolImages = list[tuple[str, str]]
+
 
 class LLMClient:
     def __init__(self) -> None:
@@ -101,8 +104,10 @@ class LLMClient:
         history: list[dict[str, str]] | None,
         max_history_messages: int,
         image_url: str | None,
+        system_prompt: str | None = None,
     ) -> list[dict[str, Any]]:
-        system_content = SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
+        base = system_prompt or SYSTEM_PROMPT
+        system_content = base + ("\n" + extra_system if extra_system else "")
         prior = list(history or [])[-max_history_messages:]
         if self.supports_vision is False:
             image_url = None
@@ -118,6 +123,7 @@ class LLMClient:
         tools: list[dict[str, Any]],
         completion_kwargs: dict[str, Any],
         first_round: bool,
+        tool_images: bool = False,
         **extra: Any,
     ):
         def call():
@@ -134,10 +140,38 @@ class LLMClient:
             return call()
         except BadRequestError:
             # Only before any tool ran: a retry must not repeat compile_and_upload.
-            if not first_round or not drop_images(messages):
+            # Images a tool just attached are the exception, they are the likely cause.
+            if not (first_round or tool_images) or not drop_images(messages):
                 raise
             self.supports_vision = False
             return call()
+
+    def _append_tool_images(
+        self,
+        messages: list[dict[str, Any]],
+        drain_images: Callable[[], ToolImages] | None,
+    ) -> bool:
+        if drain_images is None:
+            return False
+        images = drain_images() or []
+        if not images:
+            return False
+        captions = "；".join(caption for caption, _url in images)
+        if self.supports_vision is False:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"（工具准备了图片：{captions}。但当前模型不支持看图，请改用文字检索结果。）",
+                }
+            )
+            return False
+        parts: list[dict[str, Any]] = [
+            {"type": "text", "text": f"以下是工具返回的图片，供你查看：{captions}"}
+        ]
+        for _caption, url in images:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        messages.append({"role": "user", "content": parts})
+        return True
 
     def chat_with_tools(
         self,
@@ -151,19 +185,26 @@ class LLMClient:
         max_history_messages: int = 20,
         should_stop: Callable[[], bool] | None = None,
         image_url: str | None = None,
+        system_prompt: str | None = None,
+        drain_images: Callable[[], ToolImages] | None = None,
     ) -> str:
         messages = self._build_messages(
-            user_message, extra_system, history, max_history_messages, image_url
+            user_message, extra_system, history, max_history_messages, image_url, system_prompt
         )
         completion_kwargs: dict[str, Any] = {}
         if voice_mode:
             completion_kwargs["max_tokens"] = 512
 
+        tool_images = False
         for round_index in range(max_rounds):
             if should_stop and should_stop():
                 return ""
             response = self._create(
-                messages, tools, completion_kwargs, first_round=round_index == 0
+                messages,
+                tools,
+                completion_kwargs,
+                first_round=round_index == 0,
+                tool_images=tool_images,
             )
             msg = response.choices[0].message
             tool_calls = msg.tool_calls or []
@@ -198,13 +239,7 @@ class LLMClient:
             for tc in tool_calls:
                 if should_stop and should_stop():
                     return ""
-                name = tc.function.name
-                args = json.loads(tc.function.arguments or "{}")
-                handler = tool_handlers.get(name)
-                if handler:
-                    result = handler(**args)
-                else:
-                    result = f"Unknown tool: {name}"
+                result = _run_tool(tool_handlers, tc.function.name, tc.function.arguments)
                 messages.append(
                     {
                         "role": "tool",
@@ -212,6 +247,7 @@ class LLMClient:
                         "content": result,
                     }
                 )
+            tool_images = self._append_tool_images(messages, drain_images)
 
         return "（达到工具调用轮次上限，请重试或简化问题）"
 
@@ -230,10 +266,12 @@ class LLMClient:
         on_revoke: Callable[[], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         image_url: str | None = None,
+        system_prompt: str | None = None,
+        drain_images: Callable[[], ToolImages] | None = None,
     ) -> str:
         """Stream the spoken answer. Thinking tokens go to ``on_reasoning``."""
         messages = self._build_messages(
-            user_message, extra_system, history, max_history_messages, image_url
+            user_message, extra_system, history, max_history_messages, image_url, system_prompt
         )
         completion_kwargs: dict[str, Any] = {}
         if voice_mode:
@@ -250,6 +288,7 @@ class LLMClient:
                 on_reasoning,
                 on_revoke,
                 should_stop,
+                drain_images,
             )
         except _StreamInterrupted:
             return ""
@@ -265,7 +304,9 @@ class LLMClient:
         on_reasoning: Callable[[str], None] | None,
         on_revoke: Callable[[], None] | None,
         should_stop: Callable[[], bool] | None,
+        drain_images: Callable[[], ToolImages] | None = None,
     ) -> str:
+        tool_images = False
         for round_index in range(max_rounds):
             if should_stop and should_stop():
                 raise _StreamInterrupted
@@ -274,6 +315,7 @@ class LLMClient:
                 tools,
                 completion_kwargs,
                 first_round=round_index == 0,
+                tool_images=tool_images,
                 on_delta=on_delta,
                 on_reasoning=on_reasoning,
                 on_revoke=on_revoke,
@@ -302,17 +344,7 @@ class LLMClient:
             for slot in tool_calls:
                 if should_stop and should_stop():
                     raise _StreamInterrupted
-                name = slot["name"]
-                try:
-                    args = json.loads(slot["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    result = f"工具参数无法解析: {name}"
-                else:
-                    handler = tool_handlers.get(name)
-                    if handler:
-                        result = handler(**args)
-                    else:
-                        result = f"Unknown tool: {name}"
+                result = _run_tool(tool_handlers, slot["name"], slot["arguments"])
                 messages.append(
                     {
                         "role": "tool",
@@ -320,6 +352,7 @@ class LLMClient:
                         "content": result,
                     }
                 )
+            tool_images = self._append_tool_images(messages, drain_images)
 
         return "（达到工具调用轮次上限，请重试或简化问题）"
 
@@ -333,9 +366,15 @@ class LLMClient:
         on_reasoning: Callable[[str], None] | None,
         on_revoke: Callable[[], None] | None,
         should_stop: Callable[[], bool] | None,
+        tool_images: bool = False,
     ) -> tuple[str, list[dict[str, str]] | None]:
         stream = self._create(
-            messages, tools, completion_kwargs, first_round=first_round, stream=True
+            messages,
+            tools,
+            completion_kwargs,
+            first_round=first_round,
+            tool_images=tool_images,
+            stream=True,
         )
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -409,6 +448,28 @@ class LLMClient:
             return content, None
         ordered = [tool_acc[index] for index in sorted(tool_acc)]
         return content, ordered
+
+
+def _run_tool(
+    tool_handlers: dict[str, Callable[..., str]],
+    name: str,
+    arguments: str | None,
+) -> str:
+    try:
+        args = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        return f"工具参数无法解析: {name}"
+    if not isinstance(args, dict):
+        return f"工具参数必须是 JSON 对象: {name}"
+    handler = tool_handlers.get(name)
+    if handler is None:
+        return f"Unknown tool: {name}"
+    try:
+        return handler(**args)
+    except TypeError as exc:
+        return f"工具 {name} 参数不对: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"工具 {name} 执行出错: {exc}"
 
 
 def _merge_tool_call_deltas(acc: dict[int, dict[str, str]], deltas: Any) -> None:

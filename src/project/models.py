@@ -38,6 +38,8 @@ _SessionLocal = None
 
 def init_db() -> None:
     global _engine, _SessionLocal
+    import repair.models  # noqa: F401  registers the repair tables on Base
+
     settings = get_settings()
     settings.database_path.parent.mkdir(parents=True, exist_ok=True)
     _engine = create_engine(f"sqlite:///{settings.database_path}", future=True)
