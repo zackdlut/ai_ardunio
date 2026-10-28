@@ -4,7 +4,7 @@ import json
 from typing import Any, Callable
 
 import httpx
-from openai import BadRequestError, OpenAI
+from openai import AuthenticationError, BadRequestError, NotFoundError, OpenAI
 
 from agent.frame_image import drop_images, user_message as build_user_message
 from agent.prompts import SYSTEM_PROMPT
@@ -34,32 +34,50 @@ class _StreamInterrupted(Exception):
     """Raised when a voice turn is cancelled mid-stream."""
 
 
+_CONNECT_HINT = "请检查 OPENAI_BASE_URL、OPENAI_API_KEY 与代理（NO_PROXY / HTTPS_PROXY）"
+
+
 class LLMClient:
     def __init__(self) -> None:
         settings = get_settings()
         self._client = OpenAI(
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
+            timeout=settings.llm_timeout_s,
         )
         self._model = settings.openai_model
         self._base_url = settings.openai_base_url
+        self._vision_mode = settings.llm_vision
+        self._extra_body = settings.llm_extra_body_dict()
         # None means the server did not say; the image is sent and dropped if rejected.
-        self.supports_vision: bool | None = None
+        self.supports_vision: bool | None = {"true": True, "false": False}.get(
+            self._vision_mode
+        )
 
     def health_check(self) -> tuple[bool, str]:
+        listed = True
         try:
-            page = self._client.with_options(max_retries=0).models.list(timeout=3.0)
+            page = self._client.with_options(max_retries=0).models.list(timeout=10.0)
             names = {model.id for model in page}
             if self._model not in names:
                 return False, f"LLM 已连接，但未找到模型 {self._model}"
+        except NotFoundError:
+            # Some OpenAI-compatible gateways do not expose /models.
+            listed = False
+        except AuthenticationError as exc:
+            return False, f"LLM 鉴权失败: {exc}（请检查 OPENAI_API_KEY）"
         except Exception as exc:  # noqa: BLE001
-            return False, f"LLM 连接失败: {exc}（请检查 OPENAI_BASE_URL 与 NO_PROXY）"
-        self.supports_vision = self._probe_vision()
+            return False, f"LLM 连接失败: {exc}（{_CONNECT_HINT}）"
+        if self._vision_mode == "auto":
+            self.supports_vision = self._probe_vision()
+        head = f"LLM 连接正常（{self._model}）"
+        if not listed:
+            head += "，服务未提供模型列表，未校验模型名"
         if self.supports_vision:
-            return True, "LLM 连接正常，可以看摄像头画面"
+            return True, head + "，可以看摄像头画面"
         if self.supports_vision is False:
-            return True, "LLM 连接正常（该模型不支持图片，只发送检测结果）"
-        return True, "LLM 连接正常"
+            return True, head + "，该模型不支持图片，只发送检测结果"
+        return True, head
 
     def _probe_vision(self) -> bool | None:
         """Ask Ollama's /api/show for capabilities. Other servers return None."""
@@ -107,6 +125,7 @@ class LLMClient:
                 model=self._model,
                 messages=messages,
                 tools=tools if tools else None,
+                extra_body=self._extra_body or None,
                 **completion_kwargs,
                 **extra,
             )

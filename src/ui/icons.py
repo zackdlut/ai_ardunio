@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QLineEdit, QMenu, QTextEdit, QWidget
 
@@ -104,6 +104,20 @@ def icon_view() -> QIcon:
         p.drawArc(QRectF(2, 4, 12, 8), 20 * 16, 140 * 16)
         p.drawArc(QRectF(2, 4, 12, 8), 200 * 16, 140 * 16)
         p.drawEllipse(QRectF(6.3, 6.3, 3.4, 3.4))
+
+    return _stroke_icon(draw)
+
+
+def icon_settings() -> QIcon:
+    def draw(p: QPainter) -> None:
+        p.drawEllipse(QRectF(4.5, 4.5, 7, 7))
+        p.drawEllipse(QRectF(6.8, 6.8, 2.4, 2.4))
+        for x1, y1, x2, y2 in (
+            (8, 2, 8, 4.5), (8, 11.5, 8, 14), (2, 8, 4.5, 8), (11.5, 8, 14, 8),
+            (3.8, 3.8, 5.5, 5.5), (10.5, 10.5, 12.2, 12.2),
+            (3.8, 12.2, 5.5, 10.5), (10.5, 5.5, 12.2, 3.8),
+        ):
+            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
     return _stroke_icon(draw)
 

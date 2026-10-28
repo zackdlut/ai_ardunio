@@ -87,6 +87,7 @@ def _client_with(completions: _FakeCompletions) -> LLMClient:
     client._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     client._model = "m"
     client._base_url = "http://test/v1"
+    client._extra_body = {}
     client.supports_vision = None
     return client
 

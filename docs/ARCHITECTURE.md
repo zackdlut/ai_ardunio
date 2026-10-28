@@ -452,9 +452,14 @@ sequenceDiagram
 - `OPENAI_API_KEY` — Ollama 场景常填 `ollama`（仅作 Bearer 占位）
 - `OPENAI_MODEL` — 例如 `qwen3.8:27b`
 - **`NO_PROXY`** — 内网 Ollama **直连**，不走企业 `HTTP_PROXY`
-- `HTTP_PROXY` / `HTTPS_PROXY` — 影响访问其他外网地址；安装依赖时使用，不是运行时聊天路径
+- `HTTP_PROXY` / `HTTPS_PROXY` — 访问其他外网地址；chat 或 ASR 指向云端服务时，运行时请求也经这里出网
+- `LLM_VISION` — `auto` 时才调用 Ollama `/api/show`；`true` / `false` 直接决定是否附图
+- `LLM_EXTRA_BODY` — JSON 对象，原样合并进每次 `chat/completions` 请求体
+- `LLM_TIMEOUT_S` — 单次请求超时，默认 600 秒
 
-远程 ASR 不走 `/v1`。`OLLAMA_BASE_URL` 有值就用它，否则从 `OPENAI_BASE_URL` 去掉末尾 `/v1`，再 `POST /api/chat`。
+`OPENAI_BASE_URL` 可以指向任何 OpenAI 兼容服务（vLLM、DeepSeek、DashScope 兼容模式、OpenAI 等），前提是支持 function calling 与流式。
+
+Ollama ASR（`ASR_BACKEND=ollama`）不走 `/v1`。`OLLAMA_BASE_URL` 有值就用它，否则从 `OPENAI_BASE_URL` 去掉末尾 `/v1`，再 `POST /api/chat`。OpenAI 兼容 ASR（`ASR_BACKEND=openai`）用 `ASR_BASE_URL`，留空则沿用 `OPENAI_BASE_URL`。
 
 ### 8.1 实际请求
 
@@ -463,13 +468,15 @@ sequenceDiagram
 | 启动健康检查 | `GET` | `{OPENAI_BASE_URL}/models` |
 | 模型能力（是否看图） | `POST` | `{OPENAI_BASE_URL 去掉 /v1}/api/show` |
 | 对话（含工具、流式） | `POST` | `{OPENAI_BASE_URL}/chat/completions` |
-| 远程 ASR | `POST` | `{resolve_ollama_base_url()}/api/chat` |
+| Ollama ASR | `POST` | `{resolve_ollama_base_url()}/api/chat` |
+| OpenAI 兼容 ASR（`transcriptions`） | `POST` | `{resolve_asr_base_url()}/audio/transcriptions` |
+| OpenAI 兼容 ASR（`chat`） | `POST` | `{resolve_asr_base_url()}/chat/completions` |
 
 默认 Ollama 地址是明文 HTTP。改成 `https://` 后抓包需要解密，或直接看应用日志。
 
 ### 8.2 启动时健康检查（`LLMClient.health_check`）
 
-在 `LLMConnectWorker` 里执行，`max_retries=0`，超时 3 秒。它**不再**发送内容为 `ping` 的 chat completion。
+在 `LLMConnectWorker` 里执行，`max_retries=0`，超时 10 秒（云端经代理时握手较慢）。它**不再**发送内容为 `ping` 的 chat completion。
 
 ```http
 GET /v1/models HTTP/1.1
@@ -478,9 +485,9 @@ Authorization: Bearer ollama
 Accept: application/json
 ```
 
-返回的模型 id 集合必须包含 `OPENAI_MODEL`。缺少模型时界面提示「LLM 已连接，但未找到模型 …」。连接失败时提示检查 `OPENAI_BASE_URL` 与 `NO_PROXY`。
+返回的模型 id 集合必须包含 `OPENAI_MODEL`。缺少模型时界面提示「LLM 已连接，但未找到模型 …」。服务对 `/models` 返回 404 时视为连接正常，只是不校验模型名；401 提示检查 `OPENAI_API_KEY`；其他失败提示检查地址、Key 与代理。无论成败，客户端都会交给主窗口，失败只是警告。
 
-随后 `POST /api/show`，请求体 `{"model": "qwen3.8:27b"}`，读取响应里的 `"capabilities": ["completion", "vision", "tools", "thinking"]`，结果存到 `LLMClient.supports_vision`。
+`LLM_VISION=auto` 时随后 `POST /api/show`，请求体 `{"model": "qwen3.8:27b"}`，读取响应里的 `"capabilities": ["completion", "vision", "tools", "thinking"]`，结果存到 `LLMClient.supports_vision`。`true` / `false` 时跳过探测，直接定值。
 
 Wireshark 过滤示例：`ip.addr == 10.67.34.44 && tcp.port == 11434`，再 Follow HTTP Stream。
 
@@ -572,7 +579,7 @@ sequenceDiagram
 
 ### 8.5 远程 ASR 的 HTTP
 
-`OllamaASR` 把 16 kHz PCM 打成 WAV，再 base64 放进 `images`：
+**Ollama**：`OllamaASR` 把 16 kHz PCM 打成 WAV，再 base64 放进 `images`：
 
 ```json
 {
@@ -584,7 +591,14 @@ sequenceDiagram
 }
 ```
 
-若回复里有 `<asr_text>`，只取该标记之后的文本。超时 300 秒。这条请求走 Ollama 原生 `/api/chat`，不是 OpenAI 的 `/v1/chat/completions`。
+若回复里有 `<asr_text>`，只取该标记之后的文本。超时 `ASR_TIMEOUT_S`（默认 300 秒）。这条请求走 Ollama 原生 `/api/chat`，不是 OpenAI 的 `/v1/chat/completions`。
+
+**OpenAI 兼容**：`OpenAIASR` 用 openai SDK（`max_retries=0`），按 `ASR_API_MODE` 二选一：
+
+- `transcriptions`：multipart 上传 `speech.wav`，字段 `model=ASR_MODEL`，`ASR_LANGUAGE` 非空时带 `language`。适用于 OpenAI Whisper、SiliconFlow SenseVoice、vLLM、speaches 等。
+- `chat`：`POST /chat/completions`，`stream: false`，用户消息只有一个 `{"type": "input_audio", "input_audio": {"data": "data:audio/wav;base64,…"}}`。适用于 DashScope `qwen3-asr-flash` 这类格式；语言等参数放 `ASR_EXTRA_BODY`，如 `{"asr_options": {"language": "zh"}}`。
+
+两种模式的回复同样会剥掉 `<asr_text>` 之前的前缀。
 
 ### 8.6 与代理共存时的抓包注意点
 
@@ -678,8 +692,9 @@ sequenceDiagram
 
 ASR 后端可在语音菜单切换，立即生效：
 
-- `local`：faster-whisper，CPU、`int8`，语言 `zh`，模型规模 `WHISPER_MODEL_SIZE`（默认 `small`）。
-- `remote`：上一节的 Ollama `/api/chat`。
+- `local`：faster-whisper，模型 `WHISPER_MODEL_SIZE`（默认 `small`，也可填本地目录），设备 `WHISPER_DEVICE`（默认 `cpu`），精度 `WHISPER_COMPUTE_TYPE`（默认 `int8`），语言 `ASR_LANGUAGE`。
+- `ollama`（旧值 `remote` 等同）：第 8.5 节的 Ollama `/api/chat`。
+- `openai`：第 8.5 节的 OpenAI 兼容 ASR。
 
 TTS 只有本机后端（pyttsx3 / Windows SAPI），音色与语速为 `TTS_VOICE`、`TTS_RATE`。朗读前会去掉代码块和 Markdown，单次最长约 400 字。菜单「停止朗读」以及新的语音轮次都会 `stop()`。
 
@@ -718,20 +733,32 @@ TTS 只有本机后端（pyttsx3 / Windows SAPI），音色与语速为 `TTS_VOI
 | `LLM_SEND_FRAME` | 是否每次提问附当前画面，默认 `true` |
 | `LLM_FRAME_MAX_SIDE` | 附图长边像素，默认 `768` |
 | `OPENAI_API_KEY` | Authorization Bearer |
-| `NO_PROXY` / `no_proxy` | 内网 LLM 主机绕过代理 |
-| `OLLAMA_BASE_URL` | 远程 ASR 的 Ollama 根路径；空则从 `OPENAI_BASE_URL` 去掉 `/v1` |
+| `LLM_VISION` | `auto`（默认）/ `true` / `false` |
+| `LLM_EXTRA_BODY` | 合并进 chat 请求体的 JSON 对象 |
+| `LLM_TIMEOUT_S` | chat 请求超时，默认 600 秒 |
+| `NO_PROXY` / `no_proxy` | 内网 LLM / ASR 主机绕过代理 |
+| `OLLAMA_BASE_URL` | Ollama ASR 根路径；空则从 `OPENAI_BASE_URL` 去掉 `/v1` |
 | `ARDUINO_FQBN` | 默认 `arduino:avr:uno` |
 | `ARDUINO_CLI` | CLI 可执行文件路径；找不到时会搜常见安装位置 |
 | `CAMERA_INDEX` | 默认摄像头索引；菜单可改，运行中重开采集 |
 | `YOLO_MODEL_PATH` | `.pt` 或 OpenVINO 目录；缺失则用 `yolov8n.pt` |
 | `YOLO_DEVICE` | `gpu`（默认）/ `npu` / `cpu` / `auto` |
 | `DATABASE_PATH` | SQLite 文件路径 |
-| `ASR_BACKEND` | `local` / `remote` |
-| `WHISPER_MODEL_SIZE` | 本地 ASR 模型规模 |
-| `OLLAMA_ASR_MODEL` | 远程 ASR 模型，默认 `frozenlab/qwen3-asr:0.6b` |
+| `ASR_BACKEND` | `local` / `ollama`（`remote` 等同）/ `openai` |
+| `ASR_LANGUAGE` | 默认 `zh`，留空自动检测 |
+| `ASR_TIMEOUT_S` | 远程 ASR 超时，默认 300 秒 |
+| `WHISPER_MODEL_SIZE` | 本地 ASR 模型名或 CTranslate2 目录 |
+| `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | 本地 ASR 设备与精度，默认 `cpu` / `int8` |
+| `OLLAMA_ASR_MODEL` | Ollama ASR 模型，默认 `frozenlab/qwen3-asr:0.6b` |
+| `ASR_BASE_URL` / `ASR_API_KEY` | OpenAI 兼容 ASR 地址与 Key；空则沿用 `OPENAI_*` |
+| `ASR_MODEL` | OpenAI 兼容 ASR 模型，默认 `whisper-1` |
+| `ASR_API_MODE` | `transcriptions`（默认）/ `chat` |
+| `ASR_EXTRA_BODY` | 合并进 ASR 请求体的 JSON 对象 |
 | `TTS_ENABLED` | 启动时「语音回复」是否勾选 |
 | `TTS_VOICE` / `TTS_RATE` | 本机 TTS 音色与语速 |
 | `VAD_*` | 开麦端点：噪声倍数、最短语音、静音结尾、打断阈值与回声宽限 |
+
+顶栏「设置」打开 `SettingsDialog`（`src/ui/settings_dialog.py`），可编辑上表中 `OPENAI_*`、`LLM_*`、`ASR_*`、`WHISPER_*`、`OLLAMA_*` 各项。保存时只取有改动的键，先用 `Settings(**改动)` 校验，失败就在窗口内提示、不写文件；通过后由 `config/env_file.py` 原位改写 `.env`（保留注释与顺序，新键追加到末尾），同时写入 `os.environ`，因为进程环境变量优先于 `.env`。主窗口随后刷新 ASR 菜单提示并重建 ASR；对话相关键有变化时更新模型标签并新起 `LLMConnectWorker`，只接受最新一次连接的结果。
 
 `VAD_NOISE_MULTIPLIER`、`VAD_ONSET_MS`、`VAD_SILENCE_MS`、`VAD_BARGE_MS`、`VAD_BARGE_MIN_RMS`、`VAD_BARGE_GRACE_MS` 等完整默认值见 `config/settings.py`。
 

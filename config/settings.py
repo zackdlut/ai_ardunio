@@ -1,12 +1,27 @@
+import json
+import os
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-AsrBackend = Literal["local", "remote"]
+AsrBackend = Literal["local", "ollama", "openai"]
+AsrApiMode = Literal["transcriptions", "chat"]
+LlmVision = Literal["auto", "true", "false"]
 TtsBackend = Literal["local"]
 YoloDevice = Literal["auto", "cpu", "gpu", "npu"]
+
+_ASR_BACKEND_ALIASES = {"remote": "ollama", "whisper": "local"}
+
+
+def _json_object(text: str) -> dict[str, Any]:
+    if not text.strip():
+        return {}
+    value = json.loads(text)
+    if not isinstance(value, dict):
+        raise ValueError("must be a JSON object")
+    return value
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -25,13 +40,25 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="qwen3.8:27b", alias="OPENAI_MODEL")
     llm_send_frame: bool = Field(default=True, alias="LLM_SEND_FRAME")
     llm_frame_max_side: int = Field(default=768, alias="LLM_FRAME_MAX_SIDE")
+    llm_vision: LlmVision = Field(default="auto", alias="LLM_VISION")
+    llm_extra_body: str = Field(default="", alias="LLM_EXTRA_BODY")
+    llm_timeout_s: float = Field(default=600.0, alias="LLM_TIMEOUT_S")
 
     asr_backend: AsrBackend = Field(default="local", alias="ASR_BACKEND")
+    asr_language: str = Field(default="zh", alias="ASR_LANGUAGE")
+    asr_timeout_s: float = Field(default=300.0, alias="ASR_TIMEOUT_S")
     whisper_model_size: str = Field(default="small", alias="WHISPER_MODEL_SIZE")
+    whisper_device: str = Field(default="cpu", alias="WHISPER_DEVICE")
+    whisper_compute_type: str = Field(default="int8", alias="WHISPER_COMPUTE_TYPE")
     ollama_asr_model: str = Field(
         default="frozenlab/qwen3-asr:0.6b", alias="OLLAMA_ASR_MODEL"
     )
     ollama_base_url: str = Field(default="", alias="OLLAMA_BASE_URL")
+    asr_base_url: str = Field(default="", alias="ASR_BASE_URL")
+    asr_api_key: str = Field(default="", alias="ASR_API_KEY")
+    asr_model: str = Field(default="whisper-1", alias="ASR_MODEL")
+    asr_api_mode: AsrApiMode = Field(default="transcriptions", alias="ASR_API_MODE")
+    asr_extra_body: str = Field(default="", alias="ASR_EXTRA_BODY")
 
     tts_backend: TtsBackend = Field(default="local", alias="TTS_BACKEND")
     tts_enabled: bool = Field(default=True, alias="TTS_ENABLED")
@@ -62,12 +89,25 @@ class Settings(BaseSettings):
     )
     projects_dir: Path = Field(default=ROOT_DIR / "config" / "projects")
 
-    @field_validator("asr_backend", "yolo_device", mode="before")
+    @field_validator("asr_backend", "asr_api_mode", "llm_vision", "yolo_device", mode="before")
     @classmethod
     def _normalize_choice(cls, value: object) -> str:
         if isinstance(value, str):
-            return value.strip().lower()
+            value = value.strip().lower()
+            return _ASR_BACKEND_ALIASES.get(value, value)
         return value
+
+    @field_validator("llm_extra_body", "asr_extra_body")
+    @classmethod
+    def _check_json_object(cls, value: str) -> str:
+        _json_object(value)
+        return value
+
+    def llm_extra_body_dict(self) -> dict[str, Any]:
+        return _json_object(self.llm_extra_body)
+
+    def asr_extra_body_dict(self) -> dict[str, Any]:
+        return _json_object(self.asr_extra_body)
 
     def resolve_ollama_base_url(self) -> str:
         if self.ollama_base_url.strip():
@@ -77,6 +117,12 @@ class Settings(BaseSettings):
             return url[:-3]
         return url
 
+    def resolve_asr_base_url(self) -> str:
+        return (self.asr_base_url.strip() or self.openai_base_url).rstrip("/")
+
+    def resolve_asr_api_key(self) -> str:
+        return self.asr_api_key.strip() or self.openai_api_key
+
     @property
     def firmware_dir(self) -> Path:
         return ROOT_DIR / "firmware"
@@ -84,3 +130,17 @@ class Settings(BaseSettings):
 
 def get_settings() -> Settings:
     return Settings()
+
+
+def save_settings(values: dict[str, str], env_path: Path | None = None) -> Settings:
+    """Validate ``values`` (env names), then persist them to .env and this process.
+
+    Raises ``pydantic.ValidationError`` before anything is written.
+    """
+    from config.env_file import update_env_file
+
+    Settings(**values)
+    if values:
+        update_env_file(env_path or ROOT_DIR / ".env", values)
+        os.environ.update(values)
+    return get_settings()

@@ -32,6 +32,7 @@ from ui.camera_worker import CameraWorker
 from ui.camera_widget import CameraWidget
 from ui.chat_widget import ChatWidget
 from ui.chrome import RoundedCard, ThemedMenu
+from ui.settings_dialog import CHAT_KEYS, SettingsDialog
 from ui.icons import (
     bind_editor_menu,
     icon_camera,
@@ -43,6 +44,7 @@ from ui.icons import (
     icon_project,
     icon_refresh,
     icon_remote,
+    icon_settings,
     icon_speaker,
     icon_stop,
     icon_upload,
@@ -204,7 +206,7 @@ class LLMConnectWorker(QThread):
                 self.ready.emit(
                     None,
                     False,
-                    f"LLM 连接失败: {exc}（请检查 OPENAI_BASE_URL 与 NO_PROXY）",
+                    f"LLM 连接失败: {exc}（请检查 .env 里的 OPENAI_* 与代理设置）",
                 )
             return
         if not self.isInterruptionRequested():
@@ -444,6 +446,16 @@ class MainWindow(QMainWindow):
             button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             row.addWidget(button)
+
+        settings_btn = QToolButton()
+        settings_btn.setObjectName("toolbarButton")
+        settings_btn.setText("设置")
+        settings_btn.setIcon(with_label_gap(icon_settings(), 8))
+        settings_btn.setIconSize(QSize(24, 16))
+        settings_btn.setToolTip("对话模型与语音识别")
+        settings_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        settings_btn.clicked.connect(self._open_settings)
+        row.addWidget(settings_btn)
         return bar
 
     def _show_camera_menu(self, pos) -> None:
@@ -518,20 +530,19 @@ class MainWindow(QMainWindow):
         voice.setObjectName("appMenu")
         self._asr_group = QActionGroup(self)
         self._asr_group.setExclusive(True)
-        self._asr_local = voice.addAction(icon_local(), "本地 Whisper")
-        self._asr_local.setCheckable(True)
-        self._asr_local.setData("local")
-        self._asr_local.setToolTip("faster-whisper（CPU）")
-        self._asr_remote = voice.addAction(icon_remote(), "远程 Ollama")
-        self._asr_remote.setCheckable(True)
-        self._asr_remote.setData("remote")
-        self._asr_remote.setToolTip("Ollama qwen3-asr（见 .env）")
-        self._asr_group.addAction(self._asr_local)
-        self._asr_group.addAction(self._asr_remote)
-        if self._settings.asr_backend == "remote":
-            self._asr_remote.setChecked(True)
-        else:
-            self._asr_local.setChecked(True)
+        self._asr_actions: dict[str, QAction] = {}
+        for backend, icon, label in (
+            ("local", icon_local(), "本地 Whisper"),
+            ("ollama", icon_remote(), "远程 Ollama"),
+            ("openai", icon_remote(), "远程 API"),
+        ):
+            action = voice.addAction(icon, label)
+            action.setCheckable(True)
+            action.setData(backend)
+            self._asr_group.addAction(action)
+            self._asr_actions[backend] = action
+        self._asr_actions[self._settings.asr_backend].setChecked(True)
+        self._refresh_asr_tooltips()
         self._asr_group.triggered.connect(self._on_asr_mode_changed)
         voice.addSeparator()
         self._tts_action = voice.addAction(icon_speaker(), "语音回复")
@@ -749,6 +760,9 @@ class MainWindow(QMainWindow):
         self._replace_camera_actions([(index, f"摄像头 {index}")], pick=index)
 
     def _start_llm_connect(self) -> None:
+        previous = self._llm_connect_worker
+        if previous is not None and previous.isRunning():
+            previous.requestInterruption()
         self._llm_connect_worker = LLMConnectWorker()
         _keep_alive(self._llm_connect_worker)
         self._llm_connect_worker.ready.connect(self._on_llm_ready)
@@ -756,10 +770,37 @@ class MainWindow(QMainWindow):
 
     @Slot(object, bool, str)
     def _on_llm_ready(self, client: object, ok: bool, msg: str) -> None:
-        if self._closing:
+        if self._closing or self.sender() is not self._llm_connect_worker:
             return
         self._llm = client  # type: ignore[assignment]
         self._chat.append_system(msg if ok else f"警告: {msg}")
+
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(self._settings, self._selected_asr_backend(), self)
+        if dialog.exec() != SettingsDialog.DialogCode.Accepted or not dialog.changed:
+            return
+        self._settings = dialog.settings
+        self._chat.append_system("设置已保存到 .env")
+        self._refresh_asr_tooltips()
+        if "ASR_BACKEND" in dialog.changed:
+            self._asr_actions[self._settings.asr_backend].setChecked(True)
+        shared = {"OPENAI_BASE_URL", "OPENAI_API_KEY"} & dialog.changed
+        if dialog.changed - CHAT_KEYS or (shared and self._selected_asr_backend() != "local"):
+            self._on_asr_mode_changed()
+        if dialog.changed & CHAT_KEYS:
+            self._chat.set_model_name(self._settings.openai_model)
+            self._chat.append_system(f"正在连接对话模型 {self._settings.openai_model}…")
+            self._start_llm_connect()
+
+    def _refresh_asr_tooltips(self) -> None:
+        cfg = self._settings
+        tips = {
+            "local": f"faster-whisper {cfg.whisper_model_size}（{cfg.whisper_device}）",
+            "ollama": f"{cfg.ollama_asr_model} @ {cfg.resolve_ollama_base_url()}",
+            "openai": f"{cfg.asr_model} @ {cfg.resolve_asr_base_url()}（{cfg.asr_api_mode}）",
+        }
+        for backend, action in self._asr_actions.items():
+            action.setToolTip(tips[backend])
 
     def _selected_camera_index(self) -> int:
         action = self._camera_group.checkedAction()
@@ -918,21 +959,22 @@ class MainWindow(QMainWindow):
         self._chat.append_system(log[:500])
 
     def _selected_asr_backend(self) -> AsrBackend:
-        if self._asr_remote.isChecked():
-            return "remote"
-        return "local"
+        action = self._asr_group.checkedAction()
+        return action.data() if action is not None else "local"
 
     def _asr_mode_label(self) -> str:
-        if self._selected_asr_backend() == "remote":
-            return (
-                f"ASR：远程 Ollama（{self._settings.ollama_asr_model} @ "
-                f"{self._settings.resolve_ollama_base_url()}）"
-            )
-        return f"ASR：本地 Whisper（{self._settings.whisper_model_size}）"
+        action = self._asr_group.checkedAction()
+        if action is None:
+            return "ASR：本地 Whisper"
+        return f"ASR：{action.text()}（{action.toolTip()}）"
 
     def _on_asr_mode_changed(self, _action: QAction | None = None) -> None:
         backend = self._selected_asr_backend()
-        self._asr = create_asr(self._settings, backend=backend)
+        try:
+            self._asr = create_asr(self._settings, backend=backend)
+        except Exception as exc:  # noqa: BLE001
+            self._chat.append_system(f"ASR 切换失败: {exc}")
+            return
         self._chat.append_system(self._asr_mode_label())
 
     def _on_voice_toggled(self, active: bool) -> None:

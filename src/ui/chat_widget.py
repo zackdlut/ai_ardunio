@@ -372,9 +372,9 @@ class ChatWidget(QWidget):
         self._ptt.setCheckable(True)
         self._ptt.setToolTip("点一下开始语音辅导，再说一次结束。开口即可打断老师。")
         self._ptt.toggled.connect(self._on_voice_toggled)
-        model = QLabel(model_name)
+        self._model_label = model = QLabel()
         model.setObjectName("modelLabel")
-        model.setVisible(bool(model_name))
+        self.set_model_name(model_name)
         send_btn = QPushButton("↑")
         send_btn.setObjectName("sendButton")
         send_btn.setToolTip("发送")
@@ -399,6 +399,10 @@ class ChatWidget(QWidget):
 
     def _context_actions_now(self) -> list[QAction]:
         return self._context_actions
+
+    def set_model_name(self, name: str) -> None:
+        self._model_label.setText(name)
+        self._model_label.setVisible(bool(name))
 
     def set_voice_checked(self, checked: bool) -> None:
         self._ptt.blockSignals(True)

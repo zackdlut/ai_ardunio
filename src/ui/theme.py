@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtGui import QColor, QPalette
+
+_CHEVRON_DOWN = (Path(__file__).parent / "assets" / "chevron_down.png").as_posix()
 
 COLOR_BG = "#F3F6F4"
 COLOR_SURFACE = "#FFFFFF"
@@ -396,6 +400,88 @@ def app_stylesheet() -> str:
         color: {COLOR_ACCENT_INK};
         font-size: 12px;
         background: transparent;
+    }}
+
+    QDialog#settingsDialog {{
+        background-color: {COLOR_BG};
+    }}
+
+    QDialog#settingsDialog QTabWidget::pane {{
+        background: {COLOR_SURFACE};
+        border: 1px solid {COLOR_BORDER};
+        border-radius: 12px;
+        top: -1px;
+    }}
+
+    QDialog#settingsDialog QTabBar::tab {{
+        background: transparent;
+        color: {COLOR_TEXT_MUTED};
+        padding: 6px 14px;
+        margin: 0 4px 6px 0;
+        border-radius: 8px;
+        font-weight: 500;
+    }}
+
+    QDialog#settingsDialog QTabBar::tab:selected {{
+        background: {COLOR_ACCENT_SOFT};
+        color: {COLOR_ACCENT_INK};
+        font-weight: 600;
+    }}
+
+    QDialog#settingsDialog QTabBar::tab:hover:!selected {{
+        color: {COLOR_TEXT};
+    }}
+
+    QDialog#settingsDialog QLineEdit,
+    QDialog#settingsDialog QComboBox,
+    QDialog#settingsDialog QSpinBox {{
+        background: {COLOR_SURFACE};
+        border: 1px solid {COLOR_BORDER};
+        border-radius: 8px;
+        padding: 5px 8px;
+        min-height: 18px;
+        selection-background-color: {COLOR_ACCENT};
+        selection-color: #FFFFFF;
+    }}
+
+    QDialog#settingsDialog QLineEdit:focus,
+    QDialog#settingsDialog QComboBox:focus,
+    QDialog#settingsDialog QSpinBox:focus {{
+        border-color: {COLOR_ACCENT};
+    }}
+
+    QDialog#settingsDialog QComboBox::drop-down {{
+        border: none;
+        width: 24px;
+    }}
+
+    QDialog#settingsDialog QComboBox::down-arrow {{
+        image: url("{_CHEVRON_DOWN}");
+        width: 12px;
+        height: 12px;
+    }}
+
+    QDialog#settingsDialog QComboBox QAbstractItemView {{
+        background: {COLOR_SURFACE};
+        border: 1px solid {COLOR_BORDER};
+        border-radius: 8px;
+        padding: 4px;
+        selection-background-color: {COLOR_ACCENT_SOFT};
+        selection-color: {COLOR_TEXT};
+        outline: none;
+    }}
+
+    QLabel#settingsNote {{
+        color: {COLOR_TEXT_MUTED};
+        font-size: 12px;
+    }}
+
+    QLabel#settingsError {{
+        color: #B3261E;
+        background: #FCEEEE;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font-size: 12px;
     }}
 
     QScrollBar:vertical {{
