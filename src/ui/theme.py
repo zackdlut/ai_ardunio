@@ -174,6 +174,31 @@ def app_stylesheet() -> str:
         font-size: 13px;
     }}
 
+    QFrame#markModeBar {{
+        background-color: rgba(22, 32, 28, 210);
+        border: 1px solid rgba(255, 255, 255, 36);
+        border-radius: 10px;
+    }}
+
+    QToolButton#markModeButton {{
+        background: transparent;
+        border: none;
+        border-radius: 7px;
+        padding: 3px 10px;
+        color: #D7E2DC;
+        font-size: 12px;
+        font-weight: 600;
+    }}
+
+    QToolButton#markModeButton:hover {{
+        background-color: rgba(255, 255, 255, 30);
+    }}
+
+    QToolButton#markModeButton:checked {{
+        background-color: {COLOR_ACCENT};
+        color: #FFFFFF;
+    }}
+
     QProgressBar#stepProgress {{
         background-color: #E6EEE9;
         border: none;

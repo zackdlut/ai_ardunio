@@ -189,6 +189,8 @@ class OverlayEngine:
         height, width = frame.shape[:2]
         ring = 11 + int(3 * (0.5 + 0.5 * math.sin(pulse * math.tau)))
         for mark in marks:
+            if mark.get("kind") in ("box", "lasso") and self._draw_region_mark(frame, mark):
+                continue
             try:
                 nx = float(mark.get("nx", 0))
                 ny = float(mark.get("ny", 0))
@@ -204,6 +206,36 @@ class OverlayEngine:
             cv2.line(frame, (x + 6, y), (x + 14, y), _INK, 1, cv2.LINE_AA)
             label = str(mark.get("label") or "标记")
             self._label(frame, label, x + 16, y - 14, _INK)
+
+    def _draw_region_mark(self, frame: np.ndarray, mark: dict[str, Any]) -> bool:
+        height, width = frame.shape[:2]
+
+        def to_px(nx: Any, ny: Any) -> tuple[int, int]:
+            x = int(round(min(max(float(nx), 0.0), 1.0) * (width - 1)))
+            y = int(round(min(max(float(ny), 0.0), 1.0) * (height - 1)))
+            return x, y
+
+        try:
+            if mark.get("kind") == "lasso":
+                pts = [to_px(nx, ny) for nx, ny in mark.get("points") or ()]
+                if len(pts) < 3:
+                    return False
+                poly = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(frame, [poly], True, _AMBER, 2, cv2.LINE_AA)
+                x1 = min(p[0] for p in pts)
+                y1 = min(p[1] for p in pts)
+            else:
+                bx1, by1, bx2, by2 = mark.get("box") or ()
+                x1, y1 = to_px(bx1, by1)
+                x2, y2 = to_px(bx2, by2)
+                if x2 <= x1 or y2 <= y1:
+                    return False
+                cv2.rectangle(frame, (x1, y1), (x2, y2), _AMBER, 2, cv2.LINE_AA)
+        except (TypeError, ValueError):
+            return False
+        label = str(mark.get("label") or "标记")
+        self._label(frame, label, x1, max(4, y1 - 26), _AMBER)
+        return True
 
     def _draw_hud(
         self,
@@ -230,7 +262,7 @@ class OverlayEngine:
             self._label(frame, status, 12, bar_h + 6, _AMBER, px=16, max_width=width - 24)
 
         if not has_marks and height >= 220:
-            footer = "单击画面可标记，然后直接问「这里该怎么接」"
+            footer = "单击、拖出矩形或画圈标记，然后直接问「这里该怎么接」"
             foot_h = 28
             _fill_bar(frame, height - foot_h, height, (22, 32, 28), 0.5)
             self._label(frame, footer, 12, height - foot_h + 2, (210, 230, 216), px=15, max_width=width - 24)

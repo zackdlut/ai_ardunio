@@ -23,15 +23,17 @@ def build_extra_system(
     ]
     marks = scene_summary.get("user_marks") or []
     if marks:
+        compact = [{k: v for k, v in mark.items() if k != "points"} for mark in marks]
         parts.append(
-            "学生在画面上的标记（nx/ny 为相对宽高 0 到 1）: "
-            + json.dumps(marks, ensure_ascii=False)
+            "学生在画面上的标记（坐标均为相对宽高 0 到 1；kind=point 是单击点，"
+            "box 是拖出的矩形框，lasso 是自由圈选；nx/ny 为中心，box 为 [x1,y1,x2,y2] 范围）: "
+            + json.dumps(compact, ensure_ascii=False)
         )
         parts.append("学生若问起「这里」或某个标记，就按这些坐标和最近的器件回答。")
     if has_image:
         parts.append(
             "学生这条消息附了一张当前摄像头画面。画面上的角框、器件名、引脚高亮、"
-            "箭头、顶部提示条和「标记 N」都是程序叠加的，不是实物。"
+            "箭头、顶部提示条、「标记 N」以及橙色方框和圈线都是程序叠加的，不是实物。"
             "判断接线、极性、插孔位置时以图片为准；检测框可能漏检或误检，"
             "与视觉摘要冲突时说明你看到的情况。看不清就直说并请学生调整镜头，不要猜。"
         )

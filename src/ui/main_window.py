@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 
 from agent.frame_image import encode_frame_data_url
 from agent.tools import AgentContext, build_openai_tools, build_tool_handlers
-from vision.marks import nearest_component
+from vision.marks import components_in_mark, make_region_mark, nearest_component
 from agent.tutor_context import build_extra_system
 from arduino.board_manager import list_boards
 from config.settings import get_settings
@@ -259,6 +259,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._camera_widget.marked.connect(self._on_camera_mark)
+        self._camera_widget.region_marked.connect(self._on_camera_region)
         self._seed_camera_menu()
         self._update_step_label()
         self._chat.append_system(self._asr_mode_label())
@@ -480,7 +481,7 @@ class MainWindow(QMainWindow):
         self._pause_action.setToolTip("暂停器件识别，画面继续显示。竖起拇指可继续。")
         self._pause_action.toggled.connect(self._set_vision_paused)
         self._clear_marks_action = view.addAction(icon_clear(), "清除画面标记")
-        self._clear_marks_action.setToolTip("去掉你在画面上点出的标记")
+        self._clear_marks_action.setToolTip("去掉你在画面上点出、框出或圈出的标记")
         self._clear_marks_action.triggered.connect(self._clear_marks)
         self._view_menu = view
 
@@ -642,19 +643,45 @@ class MainWindow(QMainWindow):
 
     def _on_camera_mark(self, nx: float, ny: float) -> None:
         for mark in self._user_marks:
+            if mark.get("kind", "point") != "point":
+                continue
             if abs(float(mark["nx"]) - nx) < 0.03 and abs(float(mark["ny"]) - ny) < 0.03:
                 return
-        if len(self._user_marks) >= 6:
-            self._user_marks.pop(0)
-        self._mark_seq += 1
-        label = f"标记 {self._mark_seq}"
-        self._user_marks.append({"nx": round(nx, 3), "ny": round(ny, 3), "label": label})
-        self._push_marks()
+        label = self._next_mark_label()
+        self._add_mark({"label": label, "kind": "point", "nx": round(nx, 3), "ny": round(ny, 3)})
         near = nearest_component(self._scene, nx, ny)
         if near:
             self._chat.append_system(f"已添加{label}，靠近{near}。可以直接问「{label}这里该怎么接」。")
         else:
             self._chat.append_system(f"已添加{label}。可以直接问「{label}这里该怎么接」。")
+
+    def _on_camera_region(self, shape: dict) -> None:
+        mark = make_region_mark(shape, "")
+        if mark is None:
+            return
+        label = self._next_mark_label()
+        mark["label"] = label
+        self._add_mark(mark)
+        verb = "框出" if mark["kind"] == "box" else "圈出"
+        names = components_in_mark(self._scene, mark)
+        near = None if names else nearest_component(self._scene, mark["nx"], mark["ny"])
+        if names:
+            where = f"，里面有{'、'.join(names)}"
+        elif near:
+            where = f"，靠近{near}"
+        else:
+            where = ""
+        self._chat.append_system(f"已{verb}{label}{where}。可以直接问「{label}这里该怎么接」。")
+
+    def _next_mark_label(self) -> str:
+        self._mark_seq += 1
+        return f"标记 {self._mark_seq}"
+
+    def _add_mark(self, mark: dict) -> None:
+        if len(self._user_marks) >= 6:
+            self._user_marks.pop(0)
+        self._user_marks.append(mark)
+        self._push_marks()
 
     def _push_marks(self) -> None:
         self._camera.set_user_marks(self._user_marks)

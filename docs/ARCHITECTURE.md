@@ -12,7 +12,7 @@
 |------|----------|
 | 桌面 GUI | PySide6：顶栏菜单 + 摄像头工作区 + 右侧步骤/对话栏 |
 | 摄像头 + 检测框 | OpenCV 采集（Windows 用 DirectShow）+ Ultralytics YOLO（默认 OpenVINO，Intel GPU/NPU） |
-| 画面引导 | `OverlayEngine`：检测角标、步骤 HUD、引脚高亮、手部骨架、用户单击标记 |
+| 画面引导 | `OverlayEngine`：检测角标、步骤 HUD、引脚高亮、手部骨架、用户标记（单击点、矩形框、自由圈） |
 | 教学步骤 | JSON 项目（启动时加载 `config/projects/blink.json`）+ `ProjectStateMachine` |
 | 手势 | MediaPipe Hands → 赞 / 握拳 / V 字，经 `GestureDebouncer` 去抖 |
 | 对话助教 | OpenAI 兼容 API（默认内网 Ollama）+ Function Calling + **流式**回复 |
@@ -274,7 +274,10 @@ flowchart TD
   },
   "frame": { "width": 1280, "height": 720 },
   "user_marks": [
-    { "nx": 0.42, "ny": 0.55, "label": "标记 1" }
+    { "label": "标记 1", "kind": "point", "nx": 0.42, "ny": 0.55 },
+    { "label": "标记 2", "kind": "box", "nx": 0.3, "ny": 0.4, "box": [0.2, 0.3, 0.4, 0.5] },
+    { "label": "标记 3", "kind": "lasso", "nx": 0.7, "ny": 0.6, "box": [0.6, 0.5, 0.8, 0.7],
+      "points": [[0.6, 0.5], [0.8, 0.52], [0.75, 0.7]] }
   ]
 }
 ```
@@ -303,7 +306,15 @@ sequenceDiagram
 
 步骤切换或工具 `highlight_component` / `get_next_instruction` 会改写 `AgentContext.overlay_hint`，字段为 `hint`、`requires`、`pin`、`step_label`。`OverlayEngine` 在检测到 `ArduinoUNO` 且 `pin` 有值时，按 UNO 框内的相对矩形高亮 `D13`、`D12`、`D11`、`GND`、`5V`、`3V3`，并从目标器件画箭头。
 
-单击画面会加标记（最多 6 个，过近的点会被忽略）。`nearest_component` 在 180px 内找最近检测框，系统消息告诉学生可以问「标记 N 这里该怎么接」。这些标记的归一化坐标会进入下一轮导师上下文。
+画面标记有三种：
+
+- 单击，或拖动不足 6px：点标记（`kind=point`），过近的点会被忽略。`nearest_component` 在 180px 内找最近检测框。
+- 按住左键沿对角线拖动（通常向右下）：矩形框（`kind=box`），范围是按下点到松开点。
+- 按住左键画一圈：自由圈选（`kind=lasso`），轨迹最多保留 64 个点。
+
+画面右下角有「自动 / 点 / 框 / 圈」模式按钮，默认「自动」。自动模式下由 `stroke_kind` 按轨迹判断：起点到终点的直线距离不到轨迹长度的 75%，且围出的面积够大，就算圈，否则算矩形。另外三种模式不做猜测，直接按选定的类型处理。无论在哪种模式下，按住 Shift 拖动一律画矩形，按住 Ctrl 一律画圈（`effective_mode`）。右键仍然是摄像头菜单。
+
+拖动过程中控件在 `paintEvent` 里实时画橙色预览，松开后由 `OverlayEngine` 把方框或圈线画进视频帧。框选和圈选用 `components_in_mark` 列出中心落在区域内的器件；区域内没有器件时，退回用区域中心找最近的器件。标记最多 6 个，超出时去掉最早的一个。系统消息会提示学生可以问「标记 N 这里该怎么接」。这些标记会进入下一轮导师上下文；圈选的 `points` 不发给模型，只发外接框 `box`。
 
 ### 5.3 YOLO 运行时
 
