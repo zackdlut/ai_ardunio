@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from overlay.ar_shapes import draw_shapes
+from repair.geometry import warp_marks
 from overlay.text_sprite import TextSpriteCache, blit_bgra
 from vision.component_db import display_name
 from vision.detector import Detection
@@ -149,7 +150,11 @@ class OverlayEngine:
             self._draw_detections(out, detections)
             self._draw_guide(out, detections, hint, pulse)
         self._draw_hand(out, hand)
-        self._draw_marks(out, marks or [], pulse)
+        if repair:
+            # Repair marks live in reference coordinates like the shapes.
+            self._draw_marks_faded(out, warp_marks(marks or [], transform), pulse, shape_alpha)
+        else:
+            self._draw_marks(out, marks or [], pulse)
         self._draw_hud(
             out,
             hint,
@@ -157,7 +162,7 @@ class OverlayEngine:
             bool(marks),
             repair=repair,
             frozen=frozen,
-            track_status=track_status if repair and annotations else "",
+            track_status=track_status if repair and (annotations or marks) else "",
         )
         return out
 
@@ -227,6 +232,18 @@ class OverlayEngine:
         for pt in pts:
             cv2.circle(frame, pt, 3, _INK, -1, cv2.LINE_AA)
 
+    def _draw_marks_faded(
+        self, frame: np.ndarray, marks: list[dict[str, Any]], pulse: float, alpha: float
+    ) -> None:
+        if not marks or alpha <= 0.02:
+            return
+        if alpha >= 0.999:
+            self._draw_marks(frame, marks, pulse)
+            return
+        layer = frame.copy()
+        self._draw_marks(layer, marks, pulse)
+        cv2.addWeighted(layer, alpha, frame, 1.0 - alpha, 0, dst=frame)
+
     def _draw_marks(self, frame: np.ndarray, marks: list[dict[str, Any]], pulse: float) -> None:
         height, width = frame.shape[:2]
         ring = 11 + int(3 * (0.5 + 0.5 * math.sin(pulse * math.tau)))
@@ -261,6 +278,14 @@ class OverlayEngine:
             if mark.get("kind") == "lasso":
                 pts = [to_px(nx, ny) for nx, ny in mark.get("points") or ()]
                 if len(pts) < 3:
+                    return False
+                poly = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(frame, [poly], True, _AMBER, 2, cv2.LINE_AA)
+                x1 = min(p[0] for p in pts)
+                y1 = min(p[1] for p in pts)
+            elif mark.get("quad"):
+                pts = [to_px(nx, ny) for nx, ny in mark["quad"]]
+                if len(pts) != 4:
                     return False
                 poly = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
                 cv2.polylines(frame, [poly], True, _AMBER, 2, cv2.LINE_AA)

@@ -107,12 +107,15 @@ class RepairContext:
     zoom_max_side: int = 1280
     debug: RepairDebugLog | None = None
     _zooms: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Set when a tool put shapes on the video during the current turn.
+    drew_this_turn: bool = False
 
     def begin_turn(self, anchor_frame: np.ndarray | None, image_size: tuple[int, int] | None) -> None:
         with self._lock:
             self.anchor_frame = anchor_frame
             self.image_size = image_size
             self._zooms = {}
+            self.drew_this_turn = False
 
     # -- zoom views -----------------------------------------------------------
 
@@ -195,6 +198,8 @@ class RepairContext:
         with self._lock:
             base = [] if replace else self._annotations
             self._annotations = merge_annotations(base, items)
+            if items:
+                self.drew_this_turn = True
         self.notify("annotations")
 
     def queue_image(self, caption: str, url: str) -> None:
@@ -315,6 +320,8 @@ class RepairContext:
         guide = self.cases.start_guide(case_id, title, steps, check_id=check_id, board_box=board_box)
         with self._lock:
             self._guide = guide
+            if any(step.get("shapes") for step in steps):
+                self.drew_this_turn = True
         self._guide_changed()
         return guide
 
@@ -325,8 +332,13 @@ class RepairContext:
         guide = self.cases.set_step(guide_id, index)
         with self._lock:
             self._guide = guide
+            self._note_step_shapes_locked()
         self._guide_changed()
         return guide
+
+    def _note_step_shapes_locked(self) -> None:
+        if (self._current_step_locked() or {}).get("shapes"):
+            self.drew_this_turn = True
 
     def advance(self, mark: str = "skipped") -> dict[str, Any] | None:
         """Leave the current step (marking it ``mark`` if still pending).
@@ -348,6 +360,7 @@ class RepairContext:
             guide = self.cases.end_guide(guide_id, "done")
         with self._lock:
             self._guide = guide if guide and guide["status"] == "active" else None
+            self._note_step_shapes_locked()
         self._guide_changed()
         return guide
 
@@ -378,6 +391,8 @@ class RepairContext:
         guide = self.cases.update_step(guide_id, index, **fields)
         with self._lock:
             self._guide = guide
+            if shapes:
+                self.drew_this_turn = True
         self._guide_changed()
         return guide
 
@@ -518,7 +533,10 @@ def build_repair_tools(ifixit_enabled: bool = True) -> list[dict[str, Any]]:
     shapes = {"type": "array", "items": shape}
     board_box = {
         **box,
-        "description": "可选，被维修的板子/设备在画面里的范围 [x1,y1,x2,y2]，用于跟踪定位",
+        "description": (
+            "每次画图都要给：会跟着一起移动的那整个物体（整台手机、整块板子）在原图上的外框 [x1,y1,x2,y2]，"
+            "不带 zoom_id 换算。图形靠它跟着物体移动，不要框进桌面和背景"
+        ),
     }
     zoom_id = {
         "type": "integer",
@@ -610,7 +628,8 @@ def build_repair_tools(ifixit_enabled: bool = True) -> list[dict[str, Any]]:
         ),
         fn(
             "annotate",
-            "在摄像头画面上画 AR 图形：框、圈、点、文字、箭头、连线、表笔位置。图形会贴在板子上跟着移动",
+            "在摄像头画面上画 AR 图形：框、圈、点、文字、箭头、连线、表笔位置。图形会贴在板子上跟着移动。"
+            "回答里让用户看、碰、插、拔、测画面里的东西时，先用它画出来再说话",
             {
                 "type": "object",
                 "properties": {
@@ -643,7 +662,7 @@ def build_repair_tools(ifixit_enabled: bool = True) -> list[dict[str, Any]]:
                             "required": ["title", "instruction"],
                         },
                     },
-                    "board_box": {**board_box, "description": board_box["description"] + "，按原图坐标"},
+                    "board_box": board_box,
                     "check_id": {"type": "integer", "description": "可选，这个指引对应的检查项"},
                     "zoom_id": zoom_id,
                 },

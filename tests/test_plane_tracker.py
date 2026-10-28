@@ -11,7 +11,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "src")]
 
-from repair.geometry import warp_points  # noqa: E402
+from repair.geometry import tracking_roi, warp_points  # noqa: E402
 from vision.plane_tracker import PlaneTracker  # noqa: E402
 
 
@@ -55,6 +55,53 @@ def test_tracker_recovers_known_motion():
         got = np.array(warp_points(state.H, probes))
         want = np.array(warp_points(truth, probes))
         assert np.abs(got - want).max() < 0.02
+
+
+def _place(bg: np.ndarray, patch: np.ndarray, M: np.ndarray) -> np.ndarray:
+    h, w = bg.shape[:2]
+    warped = cv2.warpAffine(patch, M, (w, h))
+    mask = cv2.warpAffine(np.full(patch.shape[:2], 255, np.uint8), M, (w, h))
+    out = bg.copy()
+    out[mask > 0] = warped[mask > 0]
+    return out
+
+
+def _patch_pose(angle: float, cx: float, cy: float, size: tuple[int, int]) -> np.ndarray:
+    """Affine taking patch pixels to the frame: rotate about the patch centre, centre at (cx, cy)."""
+    pw, ph = size
+    M = cv2.getRotationMatrix2D((pw / 2, ph / 2), angle, 1.0)
+    M[0, 2] += cx - pw / 2
+    M[1, 2] += cy - ph / 2
+    return np.vstack([M, [0, 0, 1]])
+
+
+def test_tracker_follows_a_moving_object_not_the_desk():
+    """A textured phone slides and turns over a textured desk that stays put."""
+    desk = _board(seed=3)
+    phone = _board(seed=11)[100:360, 200:400].copy()
+    cv2.rectangle(phone, (0, 0), (phone.shape[1] - 1, phone.shape[0] - 1), (250, 250, 250), 3)
+    size = (phone.shape[1], phone.shape[0])
+    w, h = desk.shape[1], desk.shape[0]
+    S = np.diag([w, h, 1.0])
+    pose0 = _patch_pose(0, 220, 230, size)
+    ref = _place(desk, phone, pose0[:2])
+    board_box = [(220 - size[0] / 2) / w, (230 - size[1] / 2) / h,
+                 (220 + size[0] / 2) / w, (230 + size[1] / 2) / h]
+    roi = tracking_roi([], board_box)
+
+    tracker = PlaneTracker(features=1500, smoothing=1.0)
+    assert tracker.set_reference(ref, roi, now=0.0)
+    cx, cy = (board_box[0] + board_box[2]) / 2, (board_box[1] + board_box[3]) / 2
+    probes = [[cx, cy], [board_box[0] + 0.03, board_box[1] + 0.03], [board_box[2] - 0.03, board_box[3] - 0.03]]
+    for i, (angle, px, py) in enumerate([(0, 300, 240), (10, 380, 260), (-12, 330, 210)]):
+        pose = _patch_pose(angle, px, py, size)
+        cur = _place(desk, phone, pose[:2])
+        truth = np.linalg.inv(S) @ pose @ np.linalg.inv(pose0) @ S
+        state = tracker.update(cur, now=0.1 * (i + 1))
+        assert state.status in ("tracking", "weak")
+        got = np.array(warp_points(state.H, probes))
+        want = np.array(warp_points(truth, probes))
+        assert np.abs(got - want).max() < 0.02, (i, got, want)
 
 
 def test_tracker_goes_lost_on_unrelated_frames():

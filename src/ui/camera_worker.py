@@ -11,7 +11,7 @@ from PySide6.QtCore import QMutex, QThread, Signal
 from gesture.debounce import GestureDebouncer
 from gesture.mediapipe_ctrl import GestureCommand, GestureHandler
 from overlay.engine import OverlayEngine
-from repair.geometry import tracking_roi, warp_shapes
+from repair.geometry import invert, tracking_roi, warp_mark, warp_marks, warp_shapes
 from ui.camera_devices import _capture_backend
 from vision.detector import YOLODetector, scale_detection_boxes
 from vision.plane_tracker import PlaneTracker
@@ -85,9 +85,19 @@ class CameraWorker(QThread):
         self._mutex.unlock()
 
     def set_user_marks(self, marks: list[dict[str, Any]]) -> None:
+        """In repair mode marks are in reference 0..1 coordinates, like the shapes."""
         self._mutex.lock()
         self._user_marks = [dict(item) for item in marks]
+        self._roi_dirty = True
         self._mutex.unlock()
+
+    def to_reference(self, mark: dict[str, Any]) -> dict[str, Any]:
+        """Carry a mark drawn on the displayed video into reference coordinates."""
+        self._mutex.lock()
+        H = None if self._frozen or self._mode != "repair" else self._track_H
+        self._mutex.unlock()
+        inverse = invert(H)
+        return warp_mark(mark, inverse) if inverse is not None else dict(mark)
 
     def set_mode(self, mode: str) -> None:
         """``repair`` skips YOLO (it only knows Arduino parts); gestures keep running."""
@@ -166,6 +176,7 @@ class CameraWorker(QThread):
         H = self._track_H
         if H is not None:
             self._shapes = warp_shapes(self._shapes, H)
+            self._user_marks = warp_marks(self._user_marks, H)
         self._ref_gen += 1
         self._ref_frame = raw
         self._track_H = None
@@ -300,10 +311,10 @@ class CameraWorker(QThread):
         gen = self._ref_gen
         pending, self._pending_ref = self._pending_ref, None
         refresh, self._roi_dirty = self._roi_dirty, False
-        roi = tracking_roi(self._shapes, self._board_box)
+        roi = tracking_roi(self._shapes, self._board_box, self._user_marks)
         ref_frame = self._ref_frame
         frozen = self._frozen
-        has_shapes = bool(self._shapes)
+        has_shapes = bool(self._shapes or self._user_marks)
         self._mutex.unlock()
         if not enabled:
             self._publish_status("off")

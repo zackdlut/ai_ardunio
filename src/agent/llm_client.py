@@ -39,6 +39,20 @@ _CONNECT_HINT = "请检查 OPENAI_BASE_URL、OPENAI_API_KEY 与代理（NO_PROXY
 # (caption, data URL) pairs produced by tools such as view_document_page.
 ToolImages = list[tuple[str, str]]
 
+_VOICE_MAX_TOKENS = 512
+_ROUNDS_EXHAUSTED = "（达到工具调用轮次上限，请重试或简化问题）"
+
+
+def _completion_kwargs(
+    voice_mode: bool, voice_max_tokens: int | None, extra_body: dict[str, Any] | None
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if voice_mode and voice_max_tokens:
+        kwargs["max_tokens"] = voice_max_tokens
+    if extra_body:
+        kwargs["extra_body"] = dict(extra_body)
+    return kwargs
+
 
 class LLMClient:
     def __init__(self) -> None:
@@ -126,13 +140,16 @@ class LLMClient:
         tool_images: bool = False,
         **extra: Any,
     ):
+        kwargs = dict(completion_kwargs)
+        body = {**(self._extra_body or {}), **(kwargs.pop("extra_body", None) or {})}
+
         def call():
             return self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
                 tools=tools if tools else None,
-                extra_body=self._extra_body or None,
-                **completion_kwargs,
+                extra_body=body or None,
+                **kwargs,
                 **extra,
             )
 
@@ -188,17 +205,23 @@ class LLMClient:
         system_prompt: str | None = None,
         drain_images: Callable[[], ToolImages] | None = None,
         keep_preface: bool = False,
+        voice_max_tokens: int | None = _VOICE_MAX_TOKENS,
+        extra_body: dict[str, Any] | None = None,
+        follow_up: Callable[[str], str | None] | None = None,
     ) -> str:
-        """``keep_preface`` keeps what the model says before a tool call as part of the answer."""
+        """``keep_preface`` keeps what the model says before a tool call as part of the answer.
+
+        ``follow_up`` sees the answer and may return one more instruction; that
+        round only runs tools, its text is dropped and the answer is unchanged.
+        """
         messages = self._build_messages(
             user_message, extra_system, history, max_history_messages, image_url, system_prompt
         )
-        completion_kwargs: dict[str, Any] = {}
-        if voice_mode:
-            completion_kwargs["max_tokens"] = 512
+        completion_kwargs = _completion_kwargs(voice_mode, voice_max_tokens, extra_body)
 
         tool_images = False
         said: list[str] = []
+        final: str | None = None
         for round_index in range(max_rounds):
             if should_stop and should_stop():
                 return ""
@@ -209,18 +232,28 @@ class LLMClient:
                 first_round=round_index == 0,
                 tool_images=tool_images,
             )
-            msg = response.choices[0].message
+            choice = response.choices[0]
+            msg = choice.message
             tool_calls = msg.tool_calls or []
 
             if not tool_calls:
+                if final is not None:
+                    return final
                 content = (msg.content or "").strip()
                 if content or said:
-                    return "\n\n".join(said + [content] if content else said)
-                reasoning = getattr(msg, "reasoning", None) or ""
-                if isinstance(reasoning, str) and reasoning.strip():
-                    return reasoning.strip()
-                return ""
-            if keep_preface and (msg.content or "").strip():
+                    reply = "\n\n".join(said + [content] if content else said)
+                else:
+                    reasoning = getattr(msg, "reasoning", None) or ""
+                    truncated = getattr(choice, "finish_reason", None) == "length"
+                    reply = reasoning.strip() if isinstance(reasoning, str) and not truncated else ""
+                nudge = follow_up(reply) if follow_up is not None and reply else None
+                if not nudge:
+                    return reply
+                final = reply
+                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append({"role": "user", "content": nudge})
+                continue
+            if keep_preface and final is None and (msg.content or "").strip():
                 said.append(msg.content.strip())
 
             messages.append(
@@ -254,7 +287,7 @@ class LLMClient:
                 )
             tool_images = self._append_tool_images(messages, drain_images)
 
-        return "（达到工具调用轮次上限，请重试或简化问题）"
+        return final if final is not None else _ROUNDS_EXHAUSTED
 
     def chat_with_tools_stream(
         self,
@@ -274,19 +307,21 @@ class LLMClient:
         system_prompt: str | None = None,
         drain_images: Callable[[], ToolImages] | None = None,
         keep_preface: bool = False,
+        voice_max_tokens: int | None = _VOICE_MAX_TOKENS,
+        extra_body: dict[str, Any] | None = None,
+        follow_up: Callable[[str], str | None] | None = None,
     ) -> str:
         """Stream the spoken answer. Thinking tokens go to ``on_reasoning``.
 
         Text streamed before a tool call is revoked (it is usually filler like
         "let me check") unless ``keep_preface``; then it stays and later rounds
-        continue after it.
+        continue after it. ``follow_up`` works as in ``chat_with_tools``; its
+        round streams nothing.
         """
         messages = self._build_messages(
             user_message, extra_system, history, max_history_messages, image_url, system_prompt
         )
-        completion_kwargs: dict[str, Any] = {}
-        if voice_mode:
-            completion_kwargs["max_tokens"] = 512
+        completion_kwargs = _completion_kwargs(voice_mode, voice_max_tokens, extra_body)
 
         try:
             return self._run_stream_rounds(
@@ -301,6 +336,7 @@ class LLMClient:
                 should_stop,
                 drain_images,
                 keep_preface,
+                follow_up,
             )
         except _StreamInterrupted:
             return ""
@@ -318,28 +354,40 @@ class LLMClient:
         should_stop: Callable[[], bool] | None,
         drain_images: Callable[[], ToolImages] | None = None,
         keep_preface: bool = False,
+        follow_up: Callable[[str], str | None] | None = None,
     ) -> str:
         tool_images = False
         said: list[str] = []
+        final: str | None = None
         for round_index in range(max_rounds):
             if should_stop and should_stop():
                 raise _StreamInterrupted
+            quiet = final is not None
             content, tool_calls = self._stream_completion(
                 messages,
                 tools,
                 completion_kwargs,
                 first_round=round_index == 0,
                 tool_images=tool_images,
-                on_delta=on_delta,
-                on_reasoning=on_reasoning,
-                on_revoke=on_revoke,
+                on_delta=None if quiet else on_delta,
+                on_reasoning=None if quiet else on_reasoning,
+                on_revoke=None if quiet else on_revoke,
                 should_stop=should_stop,
-                keep_preface=keep_preface,
-                lead="\n\n" if said else "",
+                keep_preface=keep_preface and not quiet,
+                lead="\n\n" if said and not quiet else "",
             )
             if not tool_calls:
-                return "\n\n".join(said + [content] if content else said) if said else content
-            if keep_preface and content:
+                if quiet:
+                    return final
+                reply = "\n\n".join(said + [content] if content else said) if said else content
+                nudge = follow_up(reply) if follow_up is not None and reply else None
+                if not nudge:
+                    return reply
+                final = reply
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": nudge})
+                continue
+            if keep_preface and content and not quiet:
                 said.append(content)
 
             messages.append(
@@ -372,7 +420,7 @@ class LLMClient:
                 )
             tool_images = self._append_tool_images(messages, drain_images)
 
-        return "（达到工具调用轮次上限，请重试或简化问题）"
+        return final if final is not None else _ROUNDS_EXHAUSTED
 
     def _stream_completion(
         self,
@@ -401,6 +449,7 @@ class LLMClient:
         tool_acc: dict[int, dict[str, str]] = {}
         emitted = False
         saw_tool = False
+        finish = None
         splitter = ThinkSplitter()
 
         def emit_reasoning(text: str) -> None:
@@ -431,6 +480,7 @@ class LLMClient:
                     raise _StreamInterrupted
                 if not chunk.choices:
                     continue
+                finish = getattr(chunk.choices[0], "finish_reason", None) or finish
                 delta = chunk.choices[0].delta
                 if delta is None:
                     continue
@@ -464,7 +514,8 @@ class LLMClient:
                 emit_content(text)
 
         content = "".join(content_parts).strip()
-        if not saw_tool and not content:
+        # Thinking cut off by the token limit is not an answer.
+        if not saw_tool and not content and finish != "length":
             content = "".join(reasoning_parts).strip()
         if not saw_tool:
             return content, None

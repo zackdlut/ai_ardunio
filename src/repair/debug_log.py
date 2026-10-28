@@ -78,6 +78,20 @@ class RepairDebugLog:
         self._prune()
         return folder
 
+    def note(self, **fields: Any) -> None:
+        """Add fields to the current turn's ``meta.json``."""
+        with self._lock:
+            folder = self._dir
+        if folder is None:
+            return
+        path = folder / "meta.json"
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+            info.update(fields)
+            path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
     def tool(self, name: str, args: dict[str, Any], result: Any) -> None:
         with self._lock:
             folder = self._dir

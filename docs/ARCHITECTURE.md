@@ -407,7 +407,7 @@ sequenceDiagram
 
 每一轮带 `turn` 序号。打断、新的语音或关窗口会使序号前进，过期 Signal 被丢掉。
 
-语音模式下 `max_tokens=512`。正文按句号、问号、感叹号和换行切成 `SentenceBuffer`，一句一句 `tts.enqueue`。文字模式下正文直接追加到气泡；若开启「语音回复」，整段结束再用 `spoken_text_from_reply` 朗读（仍识别 `【朗读】` 标记）。语音导师提示要求模型不要输出该标记。
+教学模式的语音回合 `max_tokens=512`（维修模式不设上限，见 14.7）。正文按句号、问号、感叹号和换行切成 `SentenceBuffer`，一句一句 `tts.enqueue`。文字模式下正文直接追加到气泡；若开启「语音回复」，整段结束再用 `spoken_text_from_reply` 朗读（仍识别 `【朗读】` 标记）。语音导师提示要求模型不要输出该标记。
 
 ### 7.2 注册给模型的工具
 
@@ -766,6 +766,7 @@ TTS 只有本机后端（pyttsx3 / Windows SAPI），音色与语速为 `TTS_VOI
 | `REPAIR_BOX_FORMAT` | 模型输出框的坐标约定：`norm1000`（默认）/ `norm1` / `pixel` |
 | `REPAIR_TRACKING` | AR 图形是否跟踪板子（ORB + 单应性），默认 `true` |
 | `REPAIR_TRACK_FEATURES` / `REPAIR_TRACK_MIN_INLIERS` | 跟踪每帧特征点数（默认 1000）、判定跟上所需的最少 RANSAC 内点（默认 18） |
+| `REPAIR_VOICE_THINK` | 维修模式语音回合是否让模型思考，默认 `false`（发送 `reasoning_effort: none`），见 14.7 |
 | `REPAIR_DEBUG` / `REPAIR_DEBUG_DIR` | 维修调试记录开关（默认关）和目录（默认 `data/repair_debug`），见 14.7 |
 
 顶栏「设置」打开 `SettingsDialog`（`src/ui/settings_dialog.py`），可编辑上表中 `OPENAI_*`、`LLM_*`、`ASR_*`、`WHISPER_*`、`OLLAMA_*` 各项，以及「维修模式」页的 `IFIXIT_*`、`REPAIR_*`。保存时只取有改动的键，先用 `Settings(**改动)` 校验，失败就在窗口内提示、不写文件；通过后由 `config/env_file.py` 原位改写 `.env`（保留注释与顺序，新键追加到末尾），同时写入 `os.environ`，因为进程环境变量优先于 `.env`。主窗口随后刷新 ASR 菜单提示并重建 ASR；对话相关键有变化时更新模型标签并新起 `LLMConnectWorker`，只接受最新一次连接的结果。
@@ -895,7 +896,9 @@ flowchart LR
 
 旧的 `{box: [...]}` 标注由 `as_shape` 自动当作 `rect`。
 
-**跟踪**（`vision/plane_tracker.py`）。维修模式下推理线程不跑 YOLO，改跑 `PlaneTracker.update`：画面缩到宽 640 提取 ORB，与基准帧用 Hamming 距离 kNN 加比值检验匹配，`findHomography(RANSAC)` 求单应；内点不足、四角投影不凸、面积异常或翻转都算这一帧没跟上。H 统一表示为「基准帧 0..1 → 当前帧 0..1」，与分辨率无关；对单位正方形四角的投影做指数平滑，跳变过大时直接采用新值。状态：`tracking`（内点 ≥ 2 倍门槛）、`weak`、`lost`（连续 0.7 秒没跟上）。基准帧特征只在 ROI 内提取：优先用模型给的 `board_box`，否则取所有图形外扩一倍、至少占画面 40% 的范围，避免背景里不动的纹理拖住跟踪。
+**跟踪**（`vision/plane_tracker.py`）。维修模式下推理线程不跑 YOLO，改跑 `PlaneTracker.update`：画面缩到宽 640 提取 ORB，与基准帧用 Hamming 距离 kNN 加比值检验匹配，`findHomography(RANSAC)` 求单应；内点不足、四角投影不凸、面积异常或翻转都算这一帧没跟上。H 统一表示为「基准帧 0..1 → 当前帧 0..1」，与分辨率无关；对单位正方形四角的投影做指数平滑，跳变过大时直接采用新值。状态：`tracking`（内点 ≥ 2 倍门槛）、`weak`、`lost`（连续 0.7 秒没跟上）。基准帧特征只在 ROI 内提取（`geometry.tracking_roi`）：有模型给的 `board_box` 时只在它外面留 5% 边；没有时取图形和用户标记的范围，各边外扩一半，至少占画面 8%；什么都没有才用整幅画面。ROI 不能放大：用户拿着手机、板子移动时，桌面这类不动的背景纹理一旦占多数，RANSAC 就会锁在背景上，求出的 H 接近单位阵，图形停在原地（`tests/test_plane_tracker.py` 里的合成场景：旧的 40% 下限误差 0.25，现在 < 0.02）。所以提示词和工具说明都要求每次画图带上「会一起移动的整个物体」的 `board_box`。
+
+**用户标记也跟着走**。维修模式下「标记 N」和图形一样存在基准帧坐标里：`MainWindow._add_mark` 先用 `CameraWorker.to_reference`（当前 H 的逆）把刚在画面上点、框、圈的位置换回基准帧；绘制时 `OverlayEngine.render` 用同一个 H 经 `geometry.warp_mark` 投影（点和圈线逐点变换；矩形框变换四角后存为 `quad` 画成四边形，`box` 改为外接框），跟丢时同样淡出。重新定基准时 `CameraWorker._rebase_locked` 和 `MainWindow._rebase_marks` 用同一个 H 变换各自的标记副本，所以发给模型的附图、上下文里的标记坐标和画面始终一致。标记也计入跟踪 ROI。教学模式没有 H，标记仍按屏幕坐标画。
 
 ```mermaid
 flowchart LR
@@ -912,13 +915,17 @@ flowchart LR
 
 **重新定基准**。每次向模型提问（以及定格、「重新对准」）时，`CameraWorker.anchor_snapshot()` 在一次锁内取出最新的原始帧、显示帧和当前 H：先用 H 把已有图形变换到这张帧的坐标，再把它设为新基准（代号自增，推理线程据此丢弃旧基准算出的结果）。主线程用同一个 H 调 `RepairContext.rebase`，自由标注、指引各步的图形和板子范围一起变换并写回数据库。发给模型的附图是这张原始帧加上用户的「标记 N」（`OverlayEngine.render_marks`），不画已有图形和 HUD：模型看到自己画的框和标签时，容易框到叠加层或认错元件。已有图形只以坐标列在上下文里，与附图同一坐标系。跟丢时 H 是最后一次跟上的位姿，图形停在最后出现的位置；画面上的图形 1.5 秒内淡出，HUD 提示「跟丢了」，板子回到原位会自动恢复。
 
+**必须画出来**。提示词规定：本轮附了画面，而回答让用户去看、碰、插、拔、测画面里的东西，就要在同一轮先调用 `annotate` 或 `start_guide` 画出来，说话时指着图形说（「绿框里那个口」「顺着箭头」），语音模式也一样。程序再加一道兜底（`agent/repair_nudge.py`）：`RepairContext.drew_this_turn` 在 `begin_turn` 清零，`annotate`、`start_guide`、改图形的 `update_step`、切到带图形的步骤时置位；最终回复出来后，`LLMClient` 调用 `follow_up(reply)`，`needs_drawing` 判断有附图、没画图、回复里同时有动作词（插、拔、拧、测、焊……）和位置词（那个口、底部、左边……）时，追加一条 `NUDGE_TEXT` 再跑一轮。这一轮只执行工具：不推送正文和思考，文字丢弃，返回值仍是原回复，每轮对话最多补一次；调试记录 `meta.json` 里写 `nudged: true`。
+
+**语音回合**。维修模式的语音回合不再用教学模式的 `max_tokens=512`（`voice_max_tokens=None`）：这个上限把思考也算进去，模型想完就没额度调用画图工具了。`REPAIR_VOICE_THINK=false`（默认）时语音回合额外发 `extra_body={"reasoning_effort": "none"}` 关掉思考（这台 Ollama 上 `think: false` 关不干净，`reasoning_effort: none` 可以），回得更快。`finish_reason == "length"` 时被截断的思考不再当作回复，返回空串，主窗口显示「助手没说完，再问一次」，也不朗读。语音回合仍会撤回工具调用前的铺垫话（`keep_preface=False`）：保留的话模型常把同一段指引说两遍。
+
 **分步指引**。`start_guide` 把操作拆成几步，画面只显示自由标注加当前步的图形。侧栏指引卡片显示分段步骤条（每段一步，按状态着色，当前步加高）、等宽读数「02 / 04」、操作说明、确认标准和助手反馈（没通过时卡片左侧色条变红），按钮有「上一步 / 跳过 / 做好了，帮我确认 / 结束」。点「做好了」或竖大拇指时：先取消定格，再自动发一条「我做完了第 N 步…判断标准…请看画面确认」，附上实时画面；模型调用 `confirm_step`，通过就进入下一步，不通过就把反馈显示在卡片和 HUD 上，并在画面上加纠正图形。
 
 **对话里的记录卡片**。程序代发给模型的话（请助手确认、回报检查结果、新建维修单）不显示成用户气泡，而是 `ChatWidget.append_event` 的记录卡片，只写人能看懂的内容，发给模型的完整指令不展示。`MainWindow._announce_guide` 比较指引前后各步的状态与反馈：指引开始、某步确认通过（盖「通过」章）、没通过（盖「未通过」章并写出反馈）、全部通过（盖「完成」章）各出一张卡片；跳过和手动结束由按钮处理函数自己出卡片。语音模式下说「好了」也会走同一条路。
 
 **放大看清**。附图最长边只有 1280，小元件、丝印容易认错。`zoom_view(box)` 从本轮全分辨率原始帧（`RepairContext.anchor_frame`，`begin_turn` 时设置）裁出该区域，外扩 6%，放大到最长边 1280（最多 4 倍），按 14.5 的方式作为图片交给模型，并返回 `zoom_id`。模型在放大图上量坐标，调用 `annotate`、`start_guide`、`update_guide_step`、`confirm_step`、`propose_checklist` 时带上 `zoom_id`，程序按裁剪区域换算回原图。`zoom_id` 只在本轮有效，未知的 id 会报错让模型重来。
 
-**调试记录**（`REPAIR_DEBUG=true`，`repair/debug_log.py`）。每轮在 `REPAIR_DEBUG_DIR/<时间>-t<轮次>/` 下保存：`sent.jpg`（发给模型的附图）、`raw.jpg`（全分辨率原始帧）、`meta.json`（问题、上下文文字、尺寸、坐标格式、跟踪状态）、`tools.jsonl`（每次工具调用的原始参数和结果，含报错）、`img_N.jpg` 与 `images.txt`（放大图、资料页）、`shapes.json` 和 `result.jpg`（本轮结束后的图形画在原始帧上）、`reply.txt`。只保留最近 60 轮。标注不准时对照 `sent.jpg`、`tools.jsonl` 和 `result.jpg`，就能分清是模型认错了东西、坐标量偏了，还是换算出了问题。
+**调试记录**（`REPAIR_DEBUG=true`，`repair/debug_log.py`）。每轮在 `REPAIR_DEBUG_DIR/<时间>-t<轮次>/` 下保存：`sent.jpg`（发给模型的附图）、`raw.jpg`（全分辨率原始帧）、`meta.json`（问题、上下文文字、尺寸、坐标格式、跟踪状态，补画过时有 `nudged`）、`tools.jsonl`（每次工具调用的原始参数和结果，含报错）、`img_N.jpg` 与 `images.txt`（放大图、资料页）、`shapes.json` 和 `result.jpg`（本轮结束后的图形画在原始帧上）、`reply.txt`。只保留最近 60 轮。标注不准时对照 `sent.jpg`、`tools.jsonl` 和 `result.jpg`，就能分清是模型认错了东西、坐标量偏了，还是换算出了问题。
 
 ---
 

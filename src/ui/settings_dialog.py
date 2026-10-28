@@ -34,6 +34,7 @@ REPAIR_KEYS = frozenset(
         "REPAIR_TRACKING",
         "REPAIR_TRACK_FEATURES",
         "REPAIR_TRACK_MIN_INLIERS",
+        "REPAIR_VOICE_THINK",
         "REPAIR_DEBUG",
         "REPAIR_DEBUG_DIR",
     }
@@ -258,6 +259,8 @@ class SettingsDialog(QDialog):
         _row(form, "图形跟踪板子", self._repair_tracking)
         _row(form, "跟踪特征点数", self._track_features)
         _row(form, "最少匹配点", self._track_inliers)
+        self._repair_voice_think = _choice(_ON_OFF, "true" if cfg.repair_voice_think else "false")
+        _row(form, "语音时先思考", self._repair_voice_think)
         self._repair_debug = _choice(_ON_OFF, "true" if cfg.repair_debug else "false")
         self._repair_debug_dir = _line(str(cfg.repair_debug_dir), "data/repair_debug")
         _row(form, "调试记录", self._repair_debug)
@@ -267,6 +270,7 @@ class SettingsDialog(QDialog):
             "标注坐标格式要与视觉模型的输出习惯一致，框总是偏移时可以换一种试试。"
             "图形跟踪用板子上的纹理把图形贴住：特征点越多越稳但越耗 CPU；"
             "最少匹配点调高能减少误跟，调低在纹理少的板子上更不容易跟丢。"
+            "语音时先思考默认关闭：语音回合不让模型长时间思考，回得更快，也不会因为思考占满长度而来不及画图。"
             "调试记录会把每轮发给模型的图片、模型的原始坐标和画出的结果存到目录里，标注不准时打开对照。"
         ))
         return page
@@ -307,6 +311,7 @@ class SettingsDialog(QDialog):
             "REPAIR_TRACKING": self._repair_tracking.currentData(),
             "REPAIR_TRACK_FEATURES": str(self._track_features.value()),
             "REPAIR_TRACK_MIN_INLIERS": str(self._track_inliers.value()),
+            "REPAIR_VOICE_THINK": self._repair_voice_think.currentData(),
             "REPAIR_DEBUG": self._repair_debug.currentData(),
             "REPAIR_DEBUG_DIR": self._repair_debug_dir.text().strip(),
         }

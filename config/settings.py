@@ -103,6 +103,7 @@ class Settings(BaseSettings):
     repair_tracking: bool = Field(default=True, alias="REPAIR_TRACKING")
     repair_track_features: int = Field(default=1000, ge=200, le=5000, alias="REPAIR_TRACK_FEATURES")
     repair_track_min_inliers: int = Field(default=18, ge=6, le=200, alias="REPAIR_TRACK_MIN_INLIERS")
+    repair_voice_think: bool = Field(default=False, alias="REPAIR_VOICE_THINK")
     repair_debug: bool = Field(default=False, alias="REPAIR_DEBUG")
     repair_debug_dir: Path = Field(
         default=ROOT_DIR / "data" / "repair_debug", alias="REPAIR_DEBUG_DIR"

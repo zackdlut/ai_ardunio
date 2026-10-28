@@ -64,6 +64,21 @@ def _start(tools) -> dict:
     )
 
 
+def test_drew_this_turn_tracks_drawing_tools(ctx: RepairContext) -> None:
+    tools = build_repair_handlers(ctx)
+    ctx.begin_turn(None, (1280, 720))
+    assert not ctx.drew_this_turn
+    tools["annotate"](items=[{"type": "text", "at": [50, 50], "text": "先断电"}])
+    assert ctx.drew_this_turn
+    ctx.begin_turn(None, (1280, 720))
+    assert not ctx.drew_this_turn
+    _start(tools)
+    assert ctx.drew_this_turn
+    ctx.begin_turn(None, (1280, 720))
+    ctx.advance("done")
+    assert ctx.drew_this_turn
+
+
 def test_guide_tools_are_registered() -> None:
     names = {t["function"]["name"] for t in build_repair_tools()}
     assert {"start_guide", "set_guide_step", "update_guide_step", "confirm_step", "end_guide"} <= names

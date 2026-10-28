@@ -6,13 +6,14 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "src")]
 
 from overlay.engine import OverlayEngine  # noqa: E402
 from repair.annotations import as_shape, make_shape, make_shapes  # noqa: E402
-from repair.geometry import tracking_roi, warp_points, warp_shape  # noqa: E402
+from repair.geometry import invert, tracking_roi, warp_mark, warp_points, warp_shape  # noqa: E402
 
 
 def _shift(dx: float, dy: float) -> np.ndarray:
@@ -72,11 +73,63 @@ def test_warp_moves_all_points() -> None:
 
 
 def test_tracking_roi_prefers_board_and_grows() -> None:
-    assert tracking_roi([], [0.1, 0.1, 0.9, 0.8]) == [0.1, 0.1, 0.9, 0.8]
+    # The board only gets a 5% margin: growing it pulls in the static desk.
+    board = tracking_roi([], [0.3, 0.2, 0.5, 0.6])
+    assert board == pytest.approx([0.29, 0.18, 0.51, 0.62])
     assert tracking_roi([]) is None
     small = make_shape({"type": "rect", "box": [450, 450, 550, 550]})
     x1, y1, x2, y2 = tracking_roi([small])
-    assert x1 < 0.45 and x2 > 0.55 and (x2 - x1) * (y2 - y1) >= 0.4
+    assert x1 < 0.45 and x2 > 0.55
+    assert 0.08 <= (x2 - x1) * (y2 - y1) < 0.2
+
+
+def test_tracking_roi_covers_user_marks() -> None:
+    marks = [{"label": "标记 1", "nx": 0.8, "ny": 0.8}]
+    x1, y1, x2, y2 = tracking_roi([], None, marks)
+    assert x1 < 0.8 < x2 and y1 < 0.8 < y2
+    box = {"label": "标记 2", "kind": "box", "nx": 0.15, "ny": 0.15, "box": [0.1, 0.1, 0.2, 0.2]}
+    x1, y1, x2, y2 = tracking_roi([], None, [box])
+    assert x1 < 0.1 and x2 > 0.2
+
+
+def test_warp_mark_round_trip() -> None:
+    H = np.array([[1.1, 0.05, 0.02], [-0.03, 0.95, 0.04], [0.02, -0.01, 1.0]])
+    point = {"label": "标记 1", "nx": 0.4, "ny": 0.6}
+    box = {"label": "标记 2", "kind": "box", "nx": 0.25, "ny": 0.35, "box": [0.2, 0.3, 0.3, 0.4]}
+    lasso = {"label": "标记 3", "kind": "lasso", "nx": 0.5, "ny": 0.5,
+             "points": [[0.4, 0.4], [0.6, 0.4], [0.5, 0.6]]}
+    for mark in (point, box, lasso):
+        moved = warp_mark(mark, H)
+        assert moved["label"] == mark["label"]
+        assert (moved["nx"], moved["ny"]) != (mark["nx"], mark["ny"])
+        back = warp_mark(moved, invert(H))
+        assert back["nx"] == pytest.approx(mark["nx"], abs=1e-4)
+        assert back["ny"] == pytest.approx(mark["ny"], abs=1e-4)
+        if "points" in mark:
+            assert np.allclose(back["points"], mark["points"], atol=1e-4)
+    moved_box = warp_mark(box, H)
+    assert len(moved_box["quad"]) == 4 and "quad" not in box
+    xs = [p[0] for p in moved_box["quad"]]
+    assert moved_box["box"][0] == min(xs) and moved_box["box"][2] == max(xs)
+    assert np.allclose(warp_mark(moved_box, invert(H))["box"], box["box"], atol=1e-4)
+    assert warp_mark(point, None) == point
+    assert invert(np.zeros((3, 3))) is None
+
+
+def test_repair_marks_follow_the_transform() -> None:
+    frame = np.zeros((400, 600, 3), dtype=np.uint8)
+    engine = OverlayEngine()
+    marks = [{"label": "", "kind": "box", "nx": 0.15, "ny": 0.35, "box": [0.1, 0.3, 0.2, 0.4]}]
+    still = engine.render(frame, [], mode="repair", marks=marks)
+    moved = engine.render(frame, [], mode="repair", marks=marks, transform=_shift(0.2, 0.0))
+    # Left edge at x = 0.1 * 599 ~ 60, y between 120 and 160.
+    assert int(still[130:150, 58:62].max()) > 0
+    assert int(moved[130:150, 58:62].max()) == 0
+    assert int(moved[130:150, 178:182].max()) > 0
+    tutor = engine.render(frame, [], mode="tutor", marks=marks, transform=_shift(0.2, 0.0))
+    assert int(tutor[130:150, 58:62].max()) > 0
+    faded = engine.render(frame, [], mode="repair", marks=marks, shape_alpha=0.0)
+    assert int(faded[130:150, 58:62].max()) == 0
 
 
 def test_shapes_follow_the_transform_when_drawn() -> None:

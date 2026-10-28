@@ -31,6 +31,7 @@ from agent.repair_messages import (
     new_case_message,
     verify_step_message,
 )
+from agent.repair_nudge import NUDGE_TEXT, needs_drawing
 from agent.repair_tools import RepairContext, build_repair_handlers, build_repair_tools
 from agent.tools import AgentContext, build_openai_tools, build_tool_handlers
 from vision.marks import components_in_mark, make_region_mark, nearest_component
@@ -44,6 +45,7 @@ from overlay.engine import OverlayEngine
 from repair.case_manager import CaseManager
 from repair.debug_log import RepairDebugLog
 from repair.documents import DocumentLibrary
+from repair.geometry import warp_marks
 from repair.ifixit import IFixitClient
 from ui.camera_devices import list_cameras
 from ui.camera_worker import CameraWorker
@@ -148,9 +150,12 @@ class LLMWorker(QThread):
         max_rounds: int = 6,
         drain_images=None,
         keep_preface: bool = False,
+        options: dict | None = None,
     ) -> None:
         super().__init__()
         self._keep_preface = keep_preface
+        # Passed through to LLMClient: voice_max_tokens, extra_body, follow_up.
+        self._options = dict(options or {})
         self._client = client
         self._message = message
         self._tools = tools
@@ -188,6 +193,7 @@ class LLMWorker(QThread):
                     max_rounds=self._max_rounds,
                     drain_images=self._drain_images,
                     keep_preface=self._keep_preface,
+                    **self._options,
                 )
             else:
                 reply = self._client.chat_with_tools(
@@ -203,6 +209,7 @@ class LLMWorker(QThread):
                     max_rounds=self._max_rounds,
                     drain_images=self._drain_images,
                     keep_preface=self._keep_preface,
+                    **self._options,
                 )
             if not self.isInterruptionRequested():
                 self.succeeded.emit(self._turn, reply)
@@ -762,6 +769,7 @@ class MainWindow(QMainWindow):
             return self._camera_widget.latest_frame()
         raw, _shown, H = snap
         self._repair.rebase(H)
+        self._rebase_marks(H)
         self._repair.anchor_frame = raw
         self._refresh_repair_overlay()
         self._repair_clean_view = True
@@ -832,10 +840,11 @@ class MainWindow(QMainWindow):
             self._chat.append_system("已继续识别画面")
 
     def _on_camera_mark(self, nx: float, ny: float) -> None:
+        probe = self._camera.to_reference({"nx": nx, "ny": ny})
         for mark in self._user_marks:
             if mark.get("kind", "point") != "point":
                 continue
-            if abs(float(mark["nx"]) - nx) < 0.03 and abs(float(mark["ny"]) - ny) < 0.03:
+            if abs(float(mark["nx"]) - probe["nx"]) < 0.03 and abs(float(mark["ny"]) - probe["ny"]) < 0.03:
                 return
         label = self._next_mark_label()
         self._add_mark({"label": label, "kind": "point", "nx": round(nx, 3), "ny": round(ny, 3)})
@@ -874,10 +883,20 @@ class MainWindow(QMainWindow):
         return f"标记 {self._mark_seq}"
 
     def _add_mark(self, mark: dict) -> None:
+        """``mark`` is in displayed-video coordinates; it is stored in reference ones."""
         if len(self._user_marks) >= 6:
             self._user_marks.pop(0)
-        self._user_marks.append(mark)
+        self._user_marks.append(self._camera.to_reference(mark))
         self._push_marks()
+
+    def _rebase_marks(self, H: np.ndarray | None) -> None:
+        """Follow the camera's rebase, which moved its copy of the marks by ``H``."""
+        if H is None or not self._user_marks:
+            return
+        self._user_marks = warp_marks(self._user_marks, H)
+        scene = dict(self._scene)
+        scene["user_marks"] = [dict(mark) for mark in self._user_marks]
+        self._scene = scene
 
     def _push_marks(self) -> None:
         self._camera.set_user_marks(self._user_marks)
@@ -1391,6 +1410,7 @@ class MainWindow(QMainWindow):
             max_rounds=10 if repair else 6,
             drain_images=self._repair.drain_images if repair else None,
             keep_preface=repair and not voice_mode,
+            options=self._repair_llm_options(voice_mode, frame is not None) if repair else None,
         )
         _keep_alive(self._llm_worker)
         self._llm_worker.delta.connect(self._on_llm_delta)
@@ -1400,6 +1420,22 @@ class MainWindow(QMainWindow):
         self._llm_worker.failed.connect(self._on_llm_failed)
         self._chat.begin_thinking()
         self._llm_worker.start()
+
+    def _repair_llm_options(self, voice_mode: bool, has_image: bool) -> dict:
+        ctx = self._repair
+
+        def follow_up(reply: str) -> str | None:
+            if not needs_drawing(reply, has_image, ctx.drew_this_turn):
+                return None
+            if ctx.debug is not None:
+                ctx.debug.note(nudged=True)
+            return NUDGE_TEXT
+
+        # Voice repair turns still have to call drawing tools, so no small token cap.
+        options: dict = {"voice_max_tokens": None, "follow_up": follow_up}
+        if voice_mode and not self._settings.repair_voice_think:
+            options["extra_body"] = {"reasoning_effort": "none"}
+        return options
 
     @Slot(int, str)
     def _on_llm_reasoning(self, turn: int, text: str) -> None:
@@ -1469,6 +1505,15 @@ class MainWindow(QMainWindow):
             return
         self._repair_panel.set_verifying(False)
         self._finish_repair_debug(turn, reply)
+        unanswered = not reply.strip() and not self._voice_streamed and not self._answer_shown
+        if unanswered:
+            self._chat.finish_thinking()
+            self._chat.end_assistant_stream()
+            self._chat.append_system("助手没说完，再问一次")
+            self._apply_overlay_update()
+            if self._voice_active:
+                self._enter_listening()
+            return
         if self._pending_voice_mode and self._voice_active:
             rest = self._sentence_buf.flush()
             if rest:
@@ -1692,6 +1737,7 @@ class MainWindow(QMainWindow):
             self._chat.append_system("摄像头还没有画面")
             return
         self._repair.rebase(snap[2])
+        self._rebase_marks(snap[2])
         self._refresh_repair_overlay()
         self._lost_notified = False
         self._chat.append_system("已按当前画面重新锚定图形。位置对不上的话，让我重新标一下。")
@@ -1896,6 +1942,7 @@ class MainWindow(QMainWindow):
         H = self._camera.set_frozen(frozen)
         if frozen:
             self._repair.rebase(H)
+            self._rebase_marks(H)
             self._refresh_repair_overlay()
         if quiet:
             return
