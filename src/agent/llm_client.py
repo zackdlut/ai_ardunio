@@ -187,7 +187,9 @@ class LLMClient:
         image_url: str | None = None,
         system_prompt: str | None = None,
         drain_images: Callable[[], ToolImages] | None = None,
+        keep_preface: bool = False,
     ) -> str:
+        """``keep_preface`` keeps what the model says before a tool call as part of the answer."""
         messages = self._build_messages(
             user_message, extra_system, history, max_history_messages, image_url, system_prompt
         )
@@ -196,6 +198,7 @@ class LLMClient:
             completion_kwargs["max_tokens"] = 512
 
         tool_images = False
+        said: list[str] = []
         for round_index in range(max_rounds):
             if should_stop and should_stop():
                 return ""
@@ -211,12 +214,14 @@ class LLMClient:
 
             if not tool_calls:
                 content = (msg.content or "").strip()
-                if content:
-                    return content
+                if content or said:
+                    return "\n\n".join(said + [content] if content else said)
                 reasoning = getattr(msg, "reasoning", None) or ""
                 if isinstance(reasoning, str) and reasoning.strip():
                     return reasoning.strip()
                 return ""
+            if keep_preface and (msg.content or "").strip():
+                said.append(msg.content.strip())
 
             messages.append(
                 {
@@ -268,8 +273,14 @@ class LLMClient:
         image_url: str | None = None,
         system_prompt: str | None = None,
         drain_images: Callable[[], ToolImages] | None = None,
+        keep_preface: bool = False,
     ) -> str:
-        """Stream the spoken answer. Thinking tokens go to ``on_reasoning``."""
+        """Stream the spoken answer. Thinking tokens go to ``on_reasoning``.
+
+        Text streamed before a tool call is revoked (it is usually filler like
+        "let me check") unless ``keep_preface``; then it stays and later rounds
+        continue after it.
+        """
         messages = self._build_messages(
             user_message, extra_system, history, max_history_messages, image_url, system_prompt
         )
@@ -289,6 +300,7 @@ class LLMClient:
                 on_revoke,
                 should_stop,
                 drain_images,
+                keep_preface,
             )
         except _StreamInterrupted:
             return ""
@@ -305,8 +317,10 @@ class LLMClient:
         on_revoke: Callable[[], None] | None,
         should_stop: Callable[[], bool] | None,
         drain_images: Callable[[], ToolImages] | None = None,
+        keep_preface: bool = False,
     ) -> str:
         tool_images = False
+        said: list[str] = []
         for round_index in range(max_rounds):
             if should_stop and should_stop():
                 raise _StreamInterrupted
@@ -320,9 +334,13 @@ class LLMClient:
                 on_reasoning=on_reasoning,
                 on_revoke=on_revoke,
                 should_stop=should_stop,
+                keep_preface=keep_preface,
+                lead="\n\n" if said else "",
             )
             if not tool_calls:
-                return content
+                return "\n\n".join(said + [content] if content else said) if said else content
+            if keep_preface and content:
+                said.append(content)
 
             messages.append(
                 {
@@ -367,6 +385,8 @@ class LLMClient:
         on_revoke: Callable[[], None] | None,
         should_stop: Callable[[], bool] | None,
         tool_images: bool = False,
+        keep_preface: bool = False,
+        lead: str = "",
     ) -> tuple[str, list[dict[str, str]] | None]:
         stream = self._create(
             messages,
@@ -392,15 +412,17 @@ class LLMClient:
 
         def emit_content(text: str) -> None:
             nonlocal emitted
-            if not text or saw_tool:
+            if not text or (saw_tool and not keep_preface):
                 return
+            shown = text
             if not content_parts:
-                text = text.lstrip()
+                text = shown = text.lstrip()
                 if not text:
                     return
+                shown = lead + text
             content_parts.append(text)
             if on_delta is not None:
-                on_delta(text)
+                on_delta(shown)
                 emitted = True
 
         try:
@@ -422,7 +444,7 @@ class LLMClient:
                             emit_content(text)
                 tool_deltas = getattr(delta, "tool_calls", None) or []
                 if tool_deltas:
-                    if emitted and not saw_tool and on_revoke is not None:
+                    if emitted and not saw_tool and on_revoke is not None and not keep_preface:
                         on_revoke()
                     saw_tool = True
                     emitted = False

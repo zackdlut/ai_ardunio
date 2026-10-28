@@ -25,6 +25,12 @@ from PySide6.QtWidgets import (
 from agent.frame_image import encode_frame_data_url, fit_frame
 from agent.prompts import REPAIR_SYSTEM_PROMPT
 from agent.repair_context import build_repair_extra_system
+from agent.repair_messages import (
+    check_result_message,
+    ifixit_message,
+    new_case_message,
+    verify_step_message,
+)
 from agent.repair_tools import RepairContext, build_repair_handlers, build_repair_tools
 from agent.tools import AgentContext, build_openai_tools, build_tool_handlers
 from vision.marks import components_in_mark, make_region_mark, nearest_component
@@ -141,8 +147,10 @@ class LLMWorker(QThread):
         system_prompt: str | None = None,
         max_rounds: int = 6,
         drain_images=None,
+        keep_preface: bool = False,
     ) -> None:
         super().__init__()
+        self._keep_preface = keep_preface
         self._client = client
         self._message = message
         self._tools = tools
@@ -179,6 +187,7 @@ class LLMWorker(QThread):
                     system_prompt=self._system_prompt,
                     max_rounds=self._max_rounds,
                     drain_images=self._drain_images,
+                    keep_preface=self._keep_preface,
                 )
             else:
                 reply = self._client.chat_with_tools(
@@ -193,6 +202,7 @@ class LLMWorker(QThread):
                     system_prompt=self._system_prompt,
                     max_rounds=self._max_rounds,
                     drain_images=self._drain_images,
+                    keep_preface=self._keep_preface,
                 )
             if not self.isInterruptionRequested():
                 self.succeeded.emit(self._turn, reply)
@@ -1380,6 +1390,7 @@ class MainWindow(QMainWindow):
             system_prompt=REPAIR_SYSTEM_PROMPT if repair else None,
             max_rounds=10 if repair else 6,
             drain_images=self._repair.drain_images if repair else None,
+            keep_preface=repair and not voice_mode,
         )
         _keep_alive(self._llm_worker)
         self._llm_worker.delta.connect(self._on_llm_delta)
@@ -1771,10 +1782,7 @@ class MainWindow(QMainWindow):
             self._repair_panel.set_frozen(False)
             self._on_repair_freeze(False, quiet=True)
         index, step = current
-        text = f"我做完了第 {index + 1} 步「{step.get('title')}」。"
-        if step.get("verify"):
-            text += f"判断标准：{step['verify']}。"
-        text += "请看画面确认是否完成：完成就调用 confirm_step 进入下一步，没完成告诉我哪里不对。"
+        text = verify_step_message(index, step.get("title") or "")
         self._repair_panel.set_verifying(True)
         verify = step.get("verify")
         self._send_repair_message(
@@ -1807,16 +1815,8 @@ class MainWindow(QMainWindow):
         case = self._repair.new_case(device, symptom)
         self._dialog_history.clear()
         event = (f"新建维修单 #{case['id']:03d}", device or "设备未填写", symptom, "info")
-        parts = []
-        if device:
-            parts.append(f"设备：{device}")
-        if symptom:
-            parts.append(f"故障现象：{symptom}")
-        if parts:
-            self._send_repair_message(
-                "，".join(parts) + "。请先分析可能的原因，再列出检查清单，能在画面上看到的位置请标出来。",
-                event=event,
-            )
+        if device or symptom:
+            self._send_repair_message(new_case_message(device, symptom), event=event)
         else:
             self._chat.append_event(*event[:3], tone="info")
 
@@ -1829,23 +1829,16 @@ class MainWindow(QMainWindow):
         check = result["recorded"]
         nxt = result["next_check"]
         word = STATUS_TEXT.get(status, status)
-        text = f"检查 {check['seq']}「{check['title']}」结果：{word}"
-        if measured:
-            text += f"，实测 {measured}"
+        text = check_result_message(check["seq"], check["title"], status, measured, last=nxt is None)
         tone = {"pass": "pass", "fail": "fail", "skip": "skip"}.get(status, "info")
         eyebrow = f"检查 {check['seq']:02d} · {word}"
         reading = f"实测 {measured}" if measured else ""
         if status == "fail":
             detail = " · ".join(p for p in (reading, "已请助手分析下一步") if p)
-            self._send_repair_message(
-                text + "。请分析原因，告诉我下一步怎么查。", event=(eyebrow, check["title"], detail, tone)
-            )
+            self._send_repair_message(text, event=(eyebrow, check["title"], detail, tone))
         elif nxt is None:
             detail = " · ".join(p for p in (reading, "清单查完了，已请助手给结论") if p)
-            self._send_repair_message(
-                text + "。清单已经查完，请根据结果给出结论或新的检查项。",
-                event=(eyebrow, check["title"], detail, tone),
-            )
+            self._send_repair_message(text, event=(eyebrow, check["title"], detail, tone))
         else:
             detail = " · ".join(p for p in (reading, f"下一项：{nxt['seq']}. {nxt['title']}") if p)
             self._chat.append_event(eyebrow, check["title"], detail, tone=tone)
@@ -1896,7 +1889,7 @@ class MainWindow(QMainWindow):
 
     def _on_repair_ifixit(self) -> None:
         device = self._repair_panel.device or "这台设备"
-        self._send_repair_message(f"请在 iFixit 上查一下{device}相关的拆机、维修指南和常见故障。")
+        self._send_repair_message(ifixit_message(device))
 
     def _on_repair_freeze(self, frozen: bool, quiet: bool = False) -> None:
         self._repair_frozen = frozen
